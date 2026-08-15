@@ -1,5 +1,5 @@
 /**
- * @file 插件配置页面
+ * @file 插件设置页面
  * @author Emac
  * @date 2025-01-05
  */
@@ -10,16 +10,11 @@ import pickBy from 'lodash.pickby';
 
 import MinotePlugin from 'main';
 import { settingsStore } from './settings';
-import MinoteLoginModel from './components/minoteLoginModel';
-import MinoteLogoutModel from './components/minoteLogoutModel';
-import MinoteRefreshCookieModel from './components/minoteRefreshCookieModel';
+import type ExternalLoginService from './externalLogin';
 
 export class MinoteSettingTab extends PluginSettingTab {
-	plugin: MinotePlugin;
-
-	constructor(app: App, plugin: MinotePlugin) {
+	constructor(app: App, plugin: MinotePlugin, private readonly externalLogin: ExternalLoginService) {
 		super(app, plugin);
-		this.plugin = plugin;
 	}
 
 	display(): void {
@@ -40,13 +35,12 @@ export class MinoteSettingTab extends PluginSettingTab {
 	}
 
 	private showLogin(): void {
-		document.createRange().createContextualFragment;
 		const desc = document.createRange().createContextualFragment(
-			`点击登录按钮，在弹出页面【扫码登录】`
+			`点击登录后会自动打开外部浏览器（Chrome/Edge），请在插件打开的独立窗口里扫码。`
 		);
 
 		new Setting(this.containerEl)
-			.setName('登录小米云服务')
+			.setName('登录小米云服务（外部浏览器）')
 			.setDesc(desc)
 			.addButton((button) => {
 				return button
@@ -54,18 +48,19 @@ export class MinoteSettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(async () => {
 						button.setDisabled(true);
-						const loginModel = new MinoteLoginModel(this);
-						await loginModel.doLogin();
+						const result = await this.externalLogin.startLogin();
+						if (!result.success) {
+							new Notice(`Minote Importer：${result.message}`);
+						}
 						this.display();
 					});
 			});
 	}
 
 	private showLogout(): void {
-		document.createRange().createContextualFragment;
 		const desc = document.createRange().createContextualFragment(
-			`1. 刷新Cookie：点击【刷新Cookie】按钮，在弹出页面点击【使用小米账号登录】<br>
-             2. 注销：点击【注销】按钮，在弹出页面右上角点击头像，下拉菜单选择【退出】`
+			`刷新时会打开专用浏览器窗口。如果登录已过期，请重新扫码。<br>
+             注销会清除此笔记库的插件登录状态和专用浏览器数据。`
 		);
 
 		new Setting(this.containerEl)
@@ -77,8 +72,10 @@ export class MinoteSettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(async () => {
 						button.setDisabled(true);
-						const refreshCookieModel = new MinoteRefreshCookieModel(this);
-						await refreshCookieModel.doRefreshCookie();
+						const result = await this.externalLogin.startRefreshCookie();
+						if (!result.success) {
+							new Notice(`Minote Importer：${result.message}`);
+						}
 						this.display();
 					});
 			})
@@ -88,17 +85,16 @@ export class MinoteSettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(async () => {
 						button.setDisabled(true);
-						const logoutModel = new MinoteLogoutModel(this);
-						await logoutModel.doLogout();
+						await this.externalLogin.logout();
 						this.display();
 					});
-			})
+			});
 	}
 
 	private notebookFolder(): void {
 		new Setting(this.containerEl)
 			.setName('笔记保存位置')
-			.setDesc('请选择Obsidian Vault中小米笔记存放的位置')
+			.setDesc('请选择 Obsidian Vault 中小米笔记存放的位置')
 			.addDropdown((dropdown) => {
 				const files = (this.app.vault.adapter as any).files;
 				const folders = pickBy(files, (val: any) => {
@@ -117,10 +113,10 @@ export class MinoteSettingTab extends PluginSettingTab {
 	}
 
 	private advancedSettings(): void {
-		this.containerEl.createEl("hr");
-		const advancedSettings = this.containerEl.createEl("details");
-		advancedSettings.createEl("summary", {
-		  text: ("高级设置")
+		this.containerEl.createEl('hr');
+		const advancedSettings = this.containerEl.createEl('details');
+		advancedSettings.createEl('summary', {
+			text: '高级设置'
 		});
 
 		new Setting(advancedSettings)
@@ -134,26 +130,26 @@ export class MinoteSettingTab extends PluginSettingTab {
 				return dropdown
 					.setValue(get(settingsStore).host)
 					.onChange(async (value) => {
+						if (this.externalLogin.isRunning()) {
+							new Notice('请先关闭登录窗口，再切换小米云服务域名');
+							this.display();
+							return;
+						}
 						settingsStore.actions.setHost(value);
+						this.display();
 					});
 			});
 
+		const detectedBrowser = this.externalLogin.detectBrowserPath();
 		new Setting(advancedSettings)
-			.setName('本地调试')
-			.addButton((button) => {
-				return button
-					.setButtonText('拷贝Settings')
-					.setCta()
-					.onClick(async () => {
-						navigator.clipboard.writeText(JSON.stringify(get(settingsStore))).then(
-							function () {
-								new Notice('拷贝Settings到剪切板成功！');
-							},
-							function (error) {
-								new Notice('拷贝Settings到剪切板失败！');
-								console.error('[minote-importer] failed to copy settings to clipboard', error);
-							}
-						);
+			.setName('外部浏览器可执行文件')
+			.setDesc(`留空时自动检测。当前检测到：${detectedBrowser || '未找到，请手动填写完整路径'}`)
+			.addText((text) => {
+				return text
+					.setPlaceholder('例如：C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe')
+					.setValue(get(settingsStore).browserPath)
+					.onChange(async (value) => {
+						settingsStore.actions.setBrowserPath(value.trim());
 					});
 			});
 	}

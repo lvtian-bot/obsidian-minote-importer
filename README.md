@@ -21,11 +21,11 @@
 
 ## 设置
 
-1. 在「Minote Importer」的插件设置中点击「登录」，在弹出的窗口中扫码。
+1. 在「Minote Importer」的插件设置中点击「登录」，在插件打开的独立 Chrome 或 Edge 窗口中扫码。登录成功后，返回 Obsidian 查看登录状态。
 2. 选择笔记保存位置，默认使用笔记库内的 `minote-importer` 文件夹。
-3. 登录过期后可在设置中刷新登录会话。需要退出时，点击「注销」，在弹出窗口的头像菜单中选择「退出」。
+3. 登录过期后可在设置中刷新登录会话。需要退出时，点击「注销」，清除插件的登录状态和该笔记库的专用浏览器登录数据。
 
-插件设置和登录会话独立保存，首次使用需要登录。
+插件使用独立的浏览器配置目录，首次使用需要登录。高级设置可指定浏览器路径。
 
 ## 使用
 
@@ -36,14 +36,13 @@
 
 ## 已知问题
 
-- 扫码后跳到系统浏览器时，插件可能无法识别登录成功。
 - 登录会话可能过期，可在插件设置中手动刷新。
 - 遇到网络连接问题时可重试。增量导入会跳过已导入且未变化的笔记。
 - 小米云端删除的笔记会保留在本地，如需清理，可手动删除对应文件。
 
 ## 来源与许可
 
-本项目由 lvtian-bot 独立维护，最初基于 Emac Shen 的 [obsidian-minote-plugin](https://github.com/emac/obsidian-minote-plugin)。原作者版权声明及 MIT 许可见 [LICENSE](LICENSE)。
+本项目由 lvtian-bot 独立维护，最初基于 Emac Shen 的 [obsidian-minote-plugin](https://github.com/emac/obsidian-minote-plugin)。外部浏览器登录方案来自 [Halo0sama 的修复提交](https://github.com/Halo0sama/obsidian-minote-plugin/commit/4001a4f4f2f823312ed7c4336caa62510056f654)。原作者版权声明及 MIT 许可见 [LICENSE](LICENSE)。
 
 ## 感谢
 - [Weread Plugin](https://github.com/zhaohongxuan/obsidian-weread-plugin)

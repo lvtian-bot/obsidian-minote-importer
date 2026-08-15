@@ -1,18 +1,21 @@
 /**
  * @file 插件主函数
- * @author Emac
+ * @author Emac (external-browser login contribution by Halo0sama)
  * @date 2025-01-05
  */
-import { Menu, Notice, Platform, Plugin } from 'obsidian';
+import { FileSystemAdapter, Menu, Notice, Plugin } from 'obsidian';
+import { get } from 'svelte/store';
 
 import { settingsStore } from './src/settings';
 import { MinoteSettingTab } from './src/settingTab';
 import FileManager from './src/fileManager';
 import MinoteApi from './src/minoteApi';
 import NoteSyncer from './src/noteSyncer';
+import ExternalLoginService from './src/externalLogin';
 
 export default class MinotePlugin extends Plugin {
 	private noteSyncer: NoteSyncer;
+	private externalLogin: ExternalLoginService;
 	private syncing = false;
 
 	async onload() {
@@ -21,6 +24,11 @@ export default class MinotePlugin extends Plugin {
 		const fileManager = new FileManager(this.app.vault, this.app.metadataCache);
 		const minoteApi = new MinoteApi();
 		this.noteSyncer = new NoteSyncer(fileManager, minoteApi);
+		const adapter = this.app.vault.adapter;
+		if (!(adapter instanceof FileSystemAdapter)) {
+			throw new Error('Minote Importer requires a desktop vault');
+		}
+		this.externalLogin = new ExternalLoginService(adapter.getBasePath());
 
 		const ribbonEl = this.addRibbonIcon('cloud-download', '导入小米笔记', (event) => {
 			if (event.button === 0) {
@@ -80,12 +88,46 @@ export default class MinotePlugin extends Plugin {
 			}
 		});
 
-		this.addSettingTab(new MinoteSettingTab(this.app, this));
+		this.addCommand({
+			id: 'login',
+			name: '使用外部浏览器登录小米云服务',
+			callback: async () => {
+				const result = await this.externalLogin.startLogin();
+				if (!result.success) {
+					new Notice(`Minote Importer：${result.message}`);
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'refresh-cookie',
+			name: '刷新小米云服务 Cookie（外部浏览器）',
+			callback: async () => {
+				const result = await this.externalLogin.startRefreshCookie();
+				if (!result.success) {
+					new Notice(`Minote Importer：${result.message}`);
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'logout',
+			name: '注销小米云服务登录',
+			callback: async () => {
+				await this.externalLogin.logout();
+			}
+		});
+
+		this.addSettingTab(new MinoteSettingTab(this.app, this, this.externalLogin));
 	}
 
 	async startSync(force = false) {
 		if (this.syncing) {
 			new Notice('正在导入小米笔记，请勿重复点击');
+			return;
+		}
+		if (!get(settingsStore).cookie) {
+			new Notice('尚未登录小米云服务，请先执行「使用外部浏览器登录小米云服务」');
 			return;
 		}
 		this.syncing = true;
@@ -94,13 +136,14 @@ export default class MinotePlugin extends Plugin {
 			const syncedCount = await this.noteSyncer.sync(force);
 			new Notice(`已导入 ${syncedCount} 篇小米笔记`);
 		} catch (e) {
-			new Notice('导入小米笔记异常，请打开设置页面检查登录状态或者刷新Cookie');
-			console.error('[minote-importer] failed to sync MI notes', e);
+			new Notice('导入小米笔记失败，请检查网络和登录状态');
+			console.error('[minote-importer] failed to import notes');
 		} finally {
 			this.syncing = false;
 		}
 	}
 
 	onunload() {
+		this.externalLogin?.dispose();
 	}
 }

@@ -1,7 +1,6 @@
 /**
  * @file 插件配置
  * @author Emac
- * @date 2025-01-05
  */
 import { writable } from 'svelte/store';
 
@@ -15,15 +14,18 @@ interface MinotePluginSettings {
 	isCookieValid: boolean;
 	user: string;
 	lastTimeSynced: SyncInfo[];
+	// 外部浏览器登录
+	browserPath: string;
 };
 
 const DEFAULT_SETTINGS: MinotePluginSettings = {
 	noteLocation: 'minote-importer',
-	host: "i.mi.com",
+	host: 'i.mi.com',
 	cookie: '',
 	isCookieValid: false,
 	user: '',
 	lastTimeSynced: [],
+	browserPath: '',
 };
 
 const createSettingsStore = () => {
@@ -55,7 +57,12 @@ const createSettingsStore = () => {
 
 	const setHost = (value: string) => {
 		store.update((state) => {
-			state.host = value;
+			if (state.host !== value) {
+				state.host = value;
+				state.cookie = '';
+				state.isCookieValid = false;
+				state.user = '';
+			}
 			return state;
 		});
 	};
@@ -69,17 +76,18 @@ const createSettingsStore = () => {
 		});
 	};
 
-	const setCookie = (cookie: string) => {
+	const setLogin = (cookie: string, user: string) => {
 		store.update((state) => {
 			state.cookie = cookie;
 			state.isCookieValid = true;
+			state.user = user;
 			return state;
 		});
 	};
 
-	const setUser = (user: string) => {
+	const setBrowserPath = (value: string) => {
 		store.update((state) => {
-			state.user = user;
+			state.browserPath = value;
 			return state;
 		});
 	};
@@ -105,8 +113,8 @@ const createSettingsStore = () => {
 			setNoteLocationFolder,
 			setHost,
 			clearCookie,
-			setCookie,
-			setUser,			
+			setLogin,
+			setBrowserPath,
 			clearLastTimeSynced,
 			setLastTimeSynced,
 		}
