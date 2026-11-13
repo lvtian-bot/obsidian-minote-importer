@@ -65,25 +65,22 @@ export default class FileManager {
 		await this.vault.createFolder(directory);
 	}
 
-	async renameFolder(oldPath: string, newPath: string): Promise<boolean> {
-		if (!oldPath || !newPath) {
-			return false;
-		}
-
-		if (!await this.exists(oldPath) || await this.exists(newPath)) {
-			return false;
-		}
-
-		await this.adapter.rename(this.vaultPath(oldPath), this.vaultPath(newPath));
-		return true;
-	}
-
 	async deleteFile(filePath: string) {
 		if (!filePath || !await this.exists(filePath)) {
 			return;
 		}
 
 		await this.adapter.remove(this.vaultPath(filePath));
+	}
+
+	async moveFile(oldPath: string, newPath: string): Promise<void> {
+		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.adapter.rename(this.vaultPath(oldPath), this.vaultPath(newPath));
+	}
+
+	async copyFile(oldPath: string, newPath: string): Promise<void> {
+		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.adapter.copy(this.vaultPath(oldPath), this.vaultPath(newPath));
 	}
 
 	async saveFile(filePath: string, content: string, createDate: number, modifyDate: number) {

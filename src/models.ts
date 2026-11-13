@@ -5,6 +5,7 @@
  */
 export interface Note {
 	id: string;
+	legacyId?: string;
 	title: string;
 	createDate: number;
 	modifyDate: number;
@@ -32,4 +33,5 @@ export interface SyncInfo {
 	decoded?: boolean;
 	imageFormatChecked?: boolean;
 	attachmentsPending?: boolean;
+	pendingMove?: string;
 }

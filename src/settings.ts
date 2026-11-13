@@ -39,6 +39,7 @@ const createSettingsStore = () => {
 	const store = writable(DEFAULT_SETTINGS as MinotePluginSettings);
 
 	let _plugin!: MinotePlugin;
+	let pendingSave = Promise.resolve();
 
 	const initialize = async (plugin: MinotePlugin): Promise<void> => {
 		_plugin = plugin;
@@ -58,10 +59,12 @@ const createSettingsStore = () => {
 		store.set(settings);
 	};
 
-	store.subscribe(async (settings) => {
+	store.subscribe(settings => {
 		if (_plugin) {
 			const data = { ...settings };
-			await _plugin.saveData(data);
+			const save = pendingSave.catch(() => undefined).then(() => _plugin.saveData(data));
+			pendingSave = save;
+			void save.catch(() => undefined);
 		}
 	});
 
@@ -109,12 +112,26 @@ const createSettingsStore = () => {
 		});
 	};
 
+	const checkpointMove = (destination: string, record: SyncInfo) => {
+		store.update(state => ({
+			...state,
+			lastImportDestination: destination,
+			lastTimeSynced: [
+				...state.lastTimeSynced.filter(item => state.lastImportDestination === destination
+					&& (item.type !== 'note' || (item.id !== record.id && item.relativePath !== record.relativePath))),
+				record,
+			],
+		}));
+		return pendingSave;
+	};
+
 	const setImportResult = (destination: string, summary: string, synced?: SyncInfo[]) => {
 		store.update(state => ({
 			...state,
 			lastImportSummary: summary,
 			...(synced ? { lastImportDestination: destination, lastTimeSynced: synced } : {}),
 		}));
+		return pendingSave;
 	};
 
 	return {
@@ -127,6 +144,7 @@ const createSettingsStore = () => {
 			setLogin,
 			setBrowserPath,
 			setImportResult,
+			checkpointMove,
 		}
 	}
 };

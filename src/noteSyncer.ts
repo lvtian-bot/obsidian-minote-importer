@@ -14,6 +14,8 @@ import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
 
 const originalImage = /☺[^\S\r\n]+[^\s<]+|<img\b[^>]*\bfileid=/i;
+const localImage = /!\[\]\(img\/([a-z\d_~.-]+)\)/gi;
+const cloudNoteTypes = new Set(['note', 'mdNote', 'mindMap']);
 
 interface ImportCounts {
 	total: number;
@@ -32,10 +34,10 @@ export default class NoteSyncer {
 	private folders: Folder[] = [];
 	private folderDict: Record<string, string> = {};
 	private thisTimeSynced: SyncInfo[] = [];
-	private lastSyncedFolders: Record<string, SyncInfo> = {};
 	private lastSyncedNotes: Record<string, SyncInfo> = {};
 
-	constructor(fileManager: FileManager, minoteApi: MinoteApi, private readonly externalLogin: ExternalLoginService) {
+	constructor(fileManager: FileManager, minoteApi: MinoteApi, private readonly externalLogin: ExternalLoginService,
+		private readonly checkpointMove?: (record: SyncInfo) => Promise<void>) {
 		this.fileManager = fileManager;
 		this.minoteApi = minoteApi;
 	}
@@ -45,12 +47,6 @@ export default class NoteSyncer {
 
 		const settings = get(settingsStore);
 		const history = settings.lastImportDestination === this.fileManager.destination ? settings.lastTimeSynced : [];
-		this.lastSyncedFolders = history
-			.filter(note => note.type === 'folder')
-			.reduce((acc: Record<string, SyncInfo>, note: SyncInfo) => {
-				acc[note.id] = { ...note };
-				return acc;
-			}, {});
 		this.lastSyncedNotes = history
 			.filter(note => note.type === 'note')
 			.reduce((acc: Record<string, SyncInfo>, note: SyncInfo) => {
@@ -59,10 +55,29 @@ export default class NoteSyncer {
 			}, {});
 
 		await this.fetchNotesAndFolders();
+		this.adoptLegacyHistory();
 		await this.createFolders();
 		const result = await this.syncNotes(force, onProgress);
 
-		return { ...result, synced: this.thisTimeSynced };
+		const tracked = new Set(this.thisTimeSynced.filter(item => item.type === 'note').map(item => item.id));
+		const retained = Object.values(this.lastSyncedNotes).filter(item => !tracked.has(item.id));
+		return { ...result, synced: [...this.thisTimeSynced, ...retained] };
+	}
+
+	private adoptLegacyHistory() {
+		const cloudIds = new Set(this.notes.map(note => note.id));
+		const claimCounts = new Map<string, number>();
+		for (const { legacyId } of this.notes) {
+			if (legacyId) claimCounts.set(legacyId, (claimCounts.get(legacyId) ?? 0) + 1);
+		}
+		for (const { id, legacyId } of this.notes) {
+			if (!legacyId || !this.lastSyncedNotes[legacyId] || id === legacyId || this.lastSyncedNotes[id]) continue;
+			if (cloudIds.has(legacyId) || claimCounts.get(legacyId) !== 1) {
+				throw new Error('Conflicting legacy note IDs');
+			}
+			this.lastSyncedNotes[id] = { ...this.lastSyncedNotes[legacyId], id };
+			delete this.lastSyncedNotes[legacyId];
+		}
 	}
 
 	private clear() {
@@ -79,25 +94,23 @@ export default class NoteSyncer {
 		// 获取第一页
 		let page = await this.minoteApi.fetchPage();
 		while (true) {
+			if (!Array.isArray(page.data?.entries) || !Array.isArray(page.data?.folders)) {
+				throw new Error('Invalid Xiaomi Notes inventory');
+			}
 			for (const entry of page.data.entries) {
-				if (entry.type === 'note') {
+				if (cloudNoteTypes.has(entry.type)) {
 					const id = String(entry.id);
-					if (seenNotes.has(id)) continue;
+					const folderId = String(entry.folderId ?? '0');
+					const extra = this.readExtraInfo(entry.extraInfo);
+					if (this.isPrivate(folderId, extra.isPrivate) || entry.status === 'deleted' || entry.status === 'purged'
+						|| !/^\d+$/.test(id) || seenNotes.has(id)) continue;
 					seenNotes.add(id);
-					// 解析笔记
-					let title = '';
-					if (entry.extraInfo) {
-						try {
-							const extra = JSON.parse(entry.extraInfo);
-							if (typeof extra?.title === 'string') title = extra.title;
-						} catch {
-							// Older entries can have incomplete metadata. Use their snippet.
-						}
-					}
+					let title = typeof extra.title === 'string' ? extra.title : '';
 					const encrypted = Boolean(entry.encryptInfo) || (typeof entry.snippet === 'string' && isEncryptedNoteContent(entry.snippet));
 					if (!title) {
 						const firstLine = !encrypted && typeof entry.snippet === 'string' ? entry.snippet.split('\n')[0] : '';
-						title = `${firstLine || '未命名笔记'}_${entry.id}`;
+						title = typeof entry.subject === 'string' && entry.subject && !isEncryptedNoteContent(entry.subject)
+							? entry.subject : `${firstLine || '未命名笔记'}_${id}`;
 					}
 					// 去除标题中的HTML标签
 					title = title.replace(/<[^>]+>/g, '');
@@ -106,10 +119,12 @@ export default class NoteSyncer {
 
 					const note: Note = {
 						id,
+						// The legacy ID can be a JSON integer beyond JavaScript's safe range.
+						legacyId: this.readLegacyId(entry.extraInfo),
 						title,
 						createDate: entry.createDate,
 						modifyDate: entry.modifyDate,
-						folderId: String(entry.folderId ?? '0'),
+						folderId,
 						encrypted,
 					};
 					this.notes.push(note);
@@ -119,7 +134,7 @@ export default class NoteSyncer {
 			for (const entry of page.data.folders) {
 				if (entry.type === 'folder') {
 					const id = String(entry.id);
-					if (id === '0' || seenFolders.has(id)) continue;
+					if (id === '0' || id === '2' || seenFolders.has(id)) continue;
 					seenFolders.add(id);
 					// 解析文件夹
 					const folder: Folder = {
@@ -145,6 +160,26 @@ export default class NoteSyncer {
 		}
 	}
 
+	private readExtraInfo(raw: unknown): { title?: unknown; isPrivate?: unknown; v3SyncId?: unknown } {
+		if (typeof raw !== 'string') return {};
+		try {
+			return JSON.parse(raw) ?? {};
+		} catch {
+			return {};
+		}
+	}
+
+	private readLegacyId(raw: unknown): string | undefined {
+		if (typeof raw !== 'string') return undefined;
+		// Quote the number before parsing so digits inside a title cannot become a top-level ID.
+		const extra = this.readExtraInfo(raw.replace(/("v3SyncId"\s*:\s*)(\d+)(?=\s*[,}])/g, '$1"$2"'));
+		return typeof extra.v3SyncId === 'string' && /^\d+$/.test(extra.v3SyncId) ? extra.v3SyncId : undefined;
+	}
+
+	private isPrivate(folderId: string, flag: unknown): boolean {
+		return folderId === '2' || flag === true || flag === 'true' || flag === 1;
+	}
+
 	private async createFolders() {
 		// 添加默认文件夹
 		this.folders.unshift({ id: '0', name: '未分类' });
@@ -159,20 +194,6 @@ export default class NoteSyncer {
 			usedNames.add(this.pathKey(folder.name));
 			// 更新文件夹字典
 			this.folderDict[folder.id] = folder.name;
-
-			// 如果上次曾同步过
-			if (folder.id in this.lastSyncedFolders) {
-				const oldFolderName = this.lastSyncedFolders[folder.id].name;
-				if (folder.name !== oldFolderName && await this.fileManager.renameFolder(oldFolderName, folder.name)) {
-					// 更新笔记路径
-					for (const note of Object.values(this.lastSyncedNotes)) {
-						const relativePath = note.relativePath.replace(/\\/g, '/');
-						if (relativePath.startsWith(oldFolderName + '/')) {
-							note.relativePath = folder.name + relativePath.slice(oldFolderName.length);
-						}
-					}
-				}
-			}
 
 			// 创建文件夹目录
 			await this.fileManager.createFolder(folder.name);
@@ -199,19 +220,34 @@ export default class NoteSyncer {
 			const previous = this.lastSyncedNotes[note.id];
 			let step = '检查本地文件';
 			try {
-				const folderPath = this.folderDict[note.folderId] || '未分类';
+				if (previous?.pendingMove) {
+					if (!await this.fileManager.exists(previous.relativePath) && await this.fileManager.exists(previous.pendingMove)) {
+						previous.relativePath = previous.pendingMove;
+					}
+					delete previous.pendingMove;
+				}
+				const folderPath = this.folderDict[note.folderId];
+				if (!folderPath) throw new Error('Missing cloud folder');
 				const unchanged = !force && previous && note.modifyDate <= previous.syncTime;
-				const checked = unchanged && await this.checkPreviousNote(note, previous, folderPath);
-				if (checked) {
-					this.thisTimeSynced.push({ ...previous, decoded: previous.decoded ?? false, imageFormatChecked: true });
-					result.skipped++;
+				if (unchanged && await this.checkPreviousNote(note, previous)) {
+					const sourceFolder = path.posix.dirname(previous.relativePath.replace(/\\/g, '/'));
+					let relativePath = previous.relativePath;
+					if (this.pathKey(sourceFolder) !== this.pathKey(folderPath)) {
+						step = '更新本地分类';
+						relativePath = await this.movePreviousNote(note, previous, folderPath);
+						result.count++;
+					} else {
+						result.skipped++;
+					}
+					this.thisTimeSynced.push({ ...previous, relativePath, decoded: previous.decoded ?? false, imageFormatChecked: true });
 					continue;
 				}
 
 				step = '读取云端正文';
 				const noteDetails = await this.minoteApi.fetchNoteDetails(note.id);
 				const entry = noteDetails.data?.entry;
-				if (typeof entry?.content !== 'string') {
+				if (typeof entry?.content !== 'string' || String(entry.id) !== note.id
+					|| this.isPrivate(String(entry.folderId), this.readExtraInfo(entry.extraInfo).isPrivate)) {
 					throw new Error('Missing note content');
 				}
 				const encrypted = note.encrypted || Boolean(entry.encryptInfo) || isEncryptedNoteContent(entry.content);
@@ -283,11 +319,20 @@ export default class NoteSyncer {
 				// 保存转换后的内容
 				step = '写入本地文件';
 				const notePath = await this.resolveNotePath(folderPath, note, encrypted, previous);
-				await this.fileManager.saveFile(notePath, content, note.createDate, note.modifyDate);
-				if (previous && this.pathKey(previous.relativePath) !== this.pathKey(notePath)
-					&& !Object.values(this.lastSyncedNotes).some(item => item.id !== note.id && this.pathKey(item.relativePath) === this.pathKey(previous.relativePath))) {
-					await this.fileManager.deleteFile(previous.relativePath).catch(() => undefined);
+				const replacing = previous && this.pathKey(previous.relativePath) !== this.pathKey(notePath)
+					&& !this.pathOwnedByAnother(note.id, previous.relativePath) && await this.fileManager.exists(previous.relativePath);
+				if (replacing && attachmentsPending) {
+					step = '处理图片';
+					throw new Error('Attachments are required before moving an existing note');
 				}
+				if (replacing) {
+					step = '更新本地分类';
+					await this.copyPreviousImages(previous.relativePath, folderPath);
+					await this.moveTrackedFile(previous, notePath);
+					previous.relativePath = notePath;
+				}
+				step = '写入本地文件';
+				await this.fileManager.saveFile(notePath, content, note.createDate, note.modifyDate);
 
 				result.count++;
 				if (attachmentsPending) result.partial++;
@@ -316,34 +361,70 @@ export default class NoteSyncer {
 		return result;
 	}
 
-	private async checkPreviousNote(note: Note, previous: SyncInfo, folder: string): Promise<boolean> {
-		const relativePath = previous.relativePath.replace(/\\/g, '/');
-		if (this.pathKey(path.posix.dirname(relativePath)) !== this.pathKey(folder)
-			|| !await this.fileManager.exists(previous.relativePath)) return false;
-		if (note.encrypted && previous.decoded !== true) return false;
+	private async checkPreviousNote(note: Note, previous: SyncInfo): Promise<boolean> {
+		if (!await this.fileManager.exists(previous.relativePath)
+			|| this.pathOwnedByAnother(note.id, previous.relativePath)) return false;
 		if (previous.attachmentsPending) return false;
 		if (previous.imageFormatChecked && previous.decoded !== undefined) return true;
 		const content = await this.fileManager.readFile(previous.relativePath);
 		return !isEncryptedNoteContent(content) && !originalImage.test(content);
 	}
 
+	private async movePreviousNote(note: Note, previous: SyncInfo, folder: string): Promise<string> {
+		const oldPath = previous.relativePath.replace(/\\/g, '/');
+		await this.copyPreviousImages(oldPath, folder, true);
+		const newPath = await this.availableNotePath(folder, note.id, path.posix.parse(oldPath).name);
+		await this.moveTrackedFile(previous, newPath);
+		return newPath;
+	}
+
+	private async copyPreviousImages(oldPath: string, folder: string, requireImages = false) {
+		const oldFolder = path.posix.dirname(oldPath.replace(/\\/g, '/'));
+		if (this.pathKey(oldFolder) === this.pathKey(folder)) return;
+		const content = await this.fileManager.readFile(oldPath);
+		for (const fileName of new Set([...content.matchAll(localImage)].map(match => match[1]))) {
+			const target = path.posix.join(folder, 'img', fileName);
+			if (await this.fileManager.hasBinaryFile(target)) continue;
+			const source = path.posix.join(oldFolder, 'img', fileName);
+			if (!await this.fileManager.hasBinaryFile(source)) {
+				if (requireImages) throw new Error('Missing local attachment');
+				continue;
+			}
+			await this.fileManager.createFolder(path.posix.join(folder, 'img'));
+			await this.fileManager.copyFile(source, target);
+		}
+	}
+
+	private async moveTrackedFile(previous: SyncInfo, newPath: string) {
+		await this.checkpointMove?.({ ...previous, pendingMove: newPath });
+		await this.fileManager.moveFile(previous.relativePath, newPath);
+	}
+
+	private pathOwnedByAnother(noteId: string, filePath: string): boolean {
+		const key = this.pathKey(filePath);
+		return [...Object.values(this.lastSyncedNotes), ...this.thisTimeSynced]
+			.some(item => item.type === 'note' && item.id !== noteId && this.pathKey(item.relativePath) === key);
+	}
+
 	private async resolveNotePath(folder: string, note: Note, encrypted: boolean, previous?: SyncInfo): Promise<string> {
-		const occupied = new Set([...Object.values(this.lastSyncedNotes), ...this.thisTimeSynced]
-			.filter(item => item.type === 'note' && item.id !== note.id)
-			.map(item => this.pathKey(item.relativePath)));
-		if (encrypted && previous && this.pathKey(path.dirname(previous.relativePath)) === this.pathKey(folder)
-			&& !occupied.has(this.pathKey(previous.relativePath))) {
+		const oldPath = previous?.relativePath.replace(/\\/g, '/');
+		if (encrypted && previous && oldPath && this.pathKey(path.posix.dirname(oldPath)) === this.pathKey(folder)
+			&& !this.pathOwnedByAnother(note.id, oldPath)) {
 			return previous.relativePath;
 		}
+		return this.availableNotePath(folder, note.id, note.title || '未命名笔记', oldPath);
+	}
+
+	private async availableNotePath(folder: string, noteId: string, name: string, oldPath?: string): Promise<string> {
 		let stem = '';
-		for (const char of note.title || '未命名笔记') {
+		for (const char of name) {
 			if (Buffer.byteLength(stem + char, 'utf8') > 180) break;
 			stem += char;
 		}
-		let candidate = path.join(folder, `${stem}.md`);
-		const owns = (value: string) => previous && this.pathKey(previous.relativePath) === this.pathKey(value);
-		for (let index = 1; occupied.has(this.pathKey(candidate)) || (!owns(candidate) && await this.fileManager.exists(candidate)); index++) {
-			candidate = path.join(folder, `${stem}_${this.safeName(note.id)}_${index}.md`);
+		let candidate = path.posix.join(folder, `${stem}.md`);
+		const owns = (value: string) => oldPath && this.pathKey(oldPath) === this.pathKey(value);
+		for (let index = 1; this.pathOwnedByAnother(noteId, candidate) || (!owns(candidate) && await this.fileManager.exists(candidate)); index++) {
+			candidate = path.posix.join(folder, `${stem}_${this.safeName(noteId)}_${index}.md`);
 		}
 		return candidate;
 	}
