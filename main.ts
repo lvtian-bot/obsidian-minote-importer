@@ -22,7 +22,7 @@ export default class MinotePlugin extends Plugin {
 		const minoteApi = new MinoteApi();
 		this.noteSyncer = new NoteSyncer(fileManager, minoteApi);
 
-		const ribbonEl = this.addRibbonIcon('cloud-download', '同步小米笔记', (event) => {
+		const ribbonEl = this.addRibbonIcon('cloud-download', '导入小米笔记', (event) => {
 			if (event.button === 0) {
 				this.startSync();
 			}
@@ -42,7 +42,7 @@ export default class MinotePlugin extends Plugin {
 			const menu = new Menu();
 			menu.addItem((item) =>
 				item
-					.setTitle('同步小米笔记')
+					.setTitle('导入小米笔记')
 					.setIcon('refresh-ccw')
 					.onClick(() => {
 						this.startSync();
@@ -51,7 +51,7 @@ export default class MinotePlugin extends Plugin {
 
 			menu.addItem((item) =>
 				item
-					.setTitle('强制同步小米笔记')
+					.setTitle('全量导入小米笔记')
 					.setIcon('refresh-ccw-dot')
 					.onClick(() => {
 						this.startSync(true);
@@ -65,16 +65,16 @@ export default class MinotePlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: 'sync',
-			name: '同步小米笔记',
+			id: 'import',
+			name: '导入小米笔记',
 			callback: () => {
 				this.startSync();
 			}
 		});
 
 		this.addCommand({
-			id: 'force-sync',
-			name: '强制同步小米笔记',
+			id: 'import-all',
+			name: '全量导入小米笔记',
 			callback: () => {
 				this.startSync(true);
 			}
@@ -85,17 +85,17 @@ export default class MinotePlugin extends Plugin {
 
 	async startSync(force = false) {
 		if (this.syncing) {
-			new Notice('正在同步小米笔记，请勿重复点击');
+			new Notice('正在导入小米笔记，请勿重复点击');
 			return;
 		}
 		this.syncing = true;
 		try {
-			new Notice('开始同步小米笔记...');
+			new Notice('开始导入小米笔记...');
 			const syncedCount = await this.noteSyncer.sync(force);
-			new Notice(`已同步 ${syncedCount} 篇小米笔记`);
+			new Notice(`已导入 ${syncedCount} 篇小米笔记`);
 		} catch (e) {
-			new Notice('同步小米笔记异常，请打开设置页面检查登录状态或者刷新Cookie');
-			console.error('[minote plugin] failed to sync MI notes', e);
+			new Notice('导入小米笔记异常，请打开设置页面检查登录状态或者刷新Cookie');
+			console.error('[minote-importer] failed to sync MI notes', e);
 		} finally {
 			this.syncing = false;
 		}

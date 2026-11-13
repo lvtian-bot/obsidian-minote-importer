@@ -22,7 +22,10 @@ export default class MinoteLoginModel {
 			parent: remote.getCurrentWindow(),
 			width: 960,
 			height: 540,
-			show: false
+			show: false,
+			webPreferences: {
+				partition: `persist:${this.settingTab.plugin.manifest.id}`
+			}
 		});
 
 		this.modal.once('ready-to-show', () => {
@@ -87,7 +90,7 @@ export default class MinoteLoginModel {
 			});
 			webContents.debugger.sendCommand('Network.enable');
 		} catch (err) {
-			console.error('[minote plugin] debugger attach failed: ', err);
+			console.error('[minote-importer] debugger attach failed: ', err);
 		}
 	}
 

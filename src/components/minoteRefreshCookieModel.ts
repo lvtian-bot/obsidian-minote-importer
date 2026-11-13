@@ -21,7 +21,10 @@ export default class MinoteRefreshCookieModel {
 			parent: remote.getCurrentWindow(),
 			width: 960,
 			height: 540,
-			show: false
+			show: false,
+			webPreferences: {
+				partition: `persist:${this.settingTab.plugin.manifest.id}`
+			}
 		});
 
 		this.modal.once('ready-to-show', () => {

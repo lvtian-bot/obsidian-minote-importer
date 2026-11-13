@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-minote-plugin",
+	"name": "obsidian-minote-importer",
 	"version": "0.1.0",
-	"description": "Obsidian Minote Plugin is a plugin to sync Minote(小米笔记) into your Obsidian Vault.",
+	"description": "将小米云笔记单向导入 Obsidian，保存为 Markdown 文件。",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -10,7 +10,7 @@
 		"svelte-check": "svelte-check --tsconfig tsconfig.json"
 	},
 	"keywords": [],
-	"author": "Emac Shen",
+	"author": "lvtian-bot",
 	"license": "MIT",
 	"devDependencies": {
 		"@types/node": "^16.11.6",
@@ -32,5 +32,14 @@
 		"electron": "^31.3.1",
 		"lodash.pickby": "^4.6.0",
 		"set-cookie-parser": "^2.5.0"
-	}
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/lvtian-bot/obsidian-minote-importer.git"
+	},
+	"homepage": "https://github.com/lvtian-bot/obsidian-minote-importer",
+	"bugs": {
+		"url": "https://github.com/lvtian-bot/obsidian-minote-importer/issues"
+	},
+	"private": true
 }

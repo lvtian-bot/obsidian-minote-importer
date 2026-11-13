@@ -151,7 +151,7 @@ export class MinoteSettingTab extends PluginSettingTab {
 							},
 							function (error) {
 								new Notice('拷贝Settings到剪切板失败！');
-								console.error('[minote plugin] failed to copy settings to clipboard', error);
+								console.error('[minote-importer] failed to copy settings to clipboard', error);
 							}
 						);
 					});

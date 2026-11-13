@@ -252,7 +252,7 @@ export default class NoteSyncer {
 					syncTime: note.modifyDate
 				});
 			} catch (err) {
-				console.error('[minote plugin] sync MI note error: ', note, err);
+				console.error('[minote-importer] sync MI note error: ', note, err);
 				continue;
 			}
 		}

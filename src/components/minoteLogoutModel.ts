@@ -21,7 +21,10 @@ export default class MinoteLogoutModel {
 			parent: remote.getCurrentWindow(),
 			width: 960,
 			height: 540,
-			show: false
+			show: false,
+			webPreferences: {
+				partition: `persist:${this.settingTab.plugin.manifest.id}`
+			}
 		});
 		this.modal.once('ready-to-show', () => {
 			this.modal.setTitle('注销小米云服务，点击头像选择【退出】');

@@ -18,7 +18,7 @@ interface MinotePluginSettings {
 };
 
 const DEFAULT_SETTINGS: MinotePluginSettings = {
-	noteLocation: 'minote',
+	noteLocation: 'minote-importer',
 	host: "i.mi.com",
 	cookie: '',
 	isCookieValid: false,

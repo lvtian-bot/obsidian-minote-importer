@@ -1,10 +1,10 @@
 {
-	"id": "minote-sync",
-	"name": "Minote Sync",
-	"version": "0.1.8",
+	"id": "minote-importer",
+	"name": "Minote Importer",
+	"version": "0.1.0",
 	"minAppVersion": "0.15.0",
-	"description": "Sync Minote(小米笔记) into your vault.",
-	"author": "Emac Shen",
-	"authorUrl": "https://emacoo.cn",
+	"description": "将小米云笔记单向导入 Obsidian，保存为 Markdown 文件。",
+	"author": "lvtian-bot",
+	"authorUrl": "https://github.com/lvtian-bot/obsidian-minote-importer",
 	"isDesktopOnly": true
 }
