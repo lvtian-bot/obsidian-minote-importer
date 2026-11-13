@@ -215,7 +215,9 @@ export default class NoteSyncer {
 					throw new Error('Missing note content');
 				}
 				const encrypted = note.encrypted || Boolean(entry.encryptInfo) || isEncryptedNoteContent(entry.content);
-				let content: string | null = encrypted && entry.content ? await this.externalLogin.readEncryptedNote(note.id) : entry.content;
+				let content: string | null = encrypted && entry.content
+					? await this.externalLogin.readEncryptedNote({ id: note.id, content: entry.content, encryptInfo: entry.encryptInfo })
+					: entry.content;
 				if (content === null || (encrypted && entry.content && (content === entry.content || isEncryptedNoteContent(content)))) {
 					result.locked++;
 					if (previous) {

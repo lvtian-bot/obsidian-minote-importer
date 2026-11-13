@@ -9,7 +9,7 @@ import path from 'path';
 import WebSocket from 'ws';
 
 import MinoteApi from './minoteApi';
-import { readWebNote } from './webNote';
+import { readWebNote, type EncryptedNote } from './webNote';
 import { settingsStore } from './settings';
 
 export interface LoginResult {
@@ -36,6 +36,10 @@ interface CdpCookie {
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const LOGIN_POLL_MS = 2_000;
 const PROFILE_RETRY_MS = 10_000;
+const IMAGE_TIMEOUT_MS = 45_000;
+const MAX_IMAGE_BYTES = 48 * 1024 * 1024;
+
+type BrowserCommand = <T>(method: string, params: object) => Promise<T>;
 
 export default class ExternalLoginService {
 	readonly loginStatus = writable<LoginStatus>('idle');
@@ -209,18 +213,64 @@ export default class ExternalLoginService {
 		return page.result?.value === true;
 	}
 
-	async readEncryptedNote(noteId: string): Promise<string | null> {
-		return this.readNotesPage([noteId]);
+	async readEncryptedNote(note: EncryptedNote): Promise<string | null> {
+		return this.readNotesPage([note]);
 	}
 
 	async readImage(image: { fileId: string; digest?: string }): Promise<ArrayBuffer | null> {
-		const result = await this.readNotesPage(['', image], 45000, 64 * 1024 * 1024);
+		const result = await this.readNotesPage([null, image], IMAGE_TIMEOUT_MS, 64 * 1024 * 1024);
+		if (result === 'legacy-image') return this.readLegacyImage(image.fileId);
 		if (!result) return null;
 		const bytes = Buffer.from(result, 'base64');
 		return Uint8Array.from(bytes).buffer;
 	}
 
-	private async readNotesPage(args: [string, { fileId: string; digest?: string }?], timeoutMs?: number, maxPayload?: number): Promise<string | null> {
+	private async readLegacyImage(fileId: string): Promise<ArrayBuffer | null> {
+		const session = this.session;
+		if (!session?.confirmed || !this.isCurrent(session)) return null;
+		try {
+			const target = await this.findNotePage(session);
+			if (!target) return null;
+			const url = 'https://' + session.host + '/file/full?' + new URLSearchParams({ type: 'note_img', fileid: fileId });
+			return await this.withBrowserConnection(target, async send => {
+				const page = await send<{ frameTree: { frame: { id: string; url: string } } }>('Page.getFrameTree', {});
+				const frame = page.frameTree.frame;
+				const pageUrl = new URL(frame.url);
+				if (pageUrl.origin !== 'https://' + session.host || !/^\/note(?:\/h5)?\/?$/.test(pageUrl.pathname)) return null;
+				// The browser follows the attachment redirect with the web page's credentials.
+				const { resource } = await send<{ resource: { success: boolean; httpStatusCode?: number; headers?: Record<string, string>; stream?: string } }>(
+					'Network.loadNetworkResource', {
+						frameId: frame.id, url, options: { disableCache: false, includeCredentials: true }
+					}
+				);
+				if (!resource.stream) return null;
+				try {
+					const contentType = Object.entries(resource.headers ?? {}).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+					if (!resource.success || resource.httpStatusCode !== 200 || !/^image\//i.test(contentType ?? '')) return null;
+					const chunks: Buffer[] = [];
+					let size = 0;
+					let eof = false;
+					while (!eof) {
+						const chunk = await send<{ base64Encoded?: boolean; data: string; eof: boolean }>('IO.read', {
+							handle: resource.stream, size: 1024 * 1024
+						});
+						const bytes = Buffer.from(chunk.data, chunk.base64Encoded ? 'base64' : 'utf8');
+						size += bytes.length;
+						if (size > MAX_IMAGE_BYTES || (!chunk.eof && !bytes.length)) return null;
+						chunks.push(bytes);
+						eof = chunk.eof;
+					}
+					return size && this.isCurrent(session) && session.confirmed ? Uint8Array.from(Buffer.concat(chunks, size)).buffer : null;
+				} finally {
+					await send('IO.close', { handle: resource.stream }).catch(() => undefined);
+				}
+			}, IMAGE_TIMEOUT_MS);
+		} catch {
+			return null;
+		}
+	}
+
+	private async readNotesPage(args: [EncryptedNote | null, { fileId: string; digest?: string }?], timeoutMs?: number, maxPayload?: number): Promise<string | null> {
 		const session = this.session;
 		if (!session?.confirmed || session.host !== get(settingsStore).host) {
 			return null;
@@ -293,31 +343,51 @@ export default class ExternalLoginService {
 		return page && page.webSocketDebuggerUrl || null;
 	}
 
-	private sendCommand<T>(endpoint: string, method: string, params: object, timeoutMs = 15000, maxPayload = 8 * 1024 * 1024): Promise<T> {
+	private sendCommand<T>(endpoint: string, method: string, params: object, timeoutMs?: number, maxPayload?: number): Promise<T> {
+		return this.withBrowserConnection(endpoint, send => send<T>(method, params), timeoutMs, maxPayload);
+	}
+
+	private withBrowserConnection<T>(
+		endpoint: string, run: (send: BrowserCommand) => Promise<T>, timeoutMs = 15000, maxPayload = 8 * 1024 * 1024
+	): Promise<T> {
 		return new Promise((resolve, reject) => {
 			const socket = new WebSocket(endpoint, { handshakeTimeout: 4000, maxPayload });
+			const unavailable = new Error('Browser command unavailable');
+			let nextId = 0;
 			let settled = false;
+			let pending: { resolve: (value: unknown) => void; reject: (error: Error) => void } | undefined;
 			const finish = (error: Error | null, result?: T) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				socket.terminate();
+				pending?.reject(unavailable);
+				pending = undefined;
 				if (error) reject(error);
 				else resolve(result as T);
+				socket.terminate();
 			};
-			const timeout = new Error('Browser command unavailable');
-			const timer = setTimeout(() => finish(timeout), timeoutMs);
-			socket.on('error', () => finish(timeout));
-			socket.on('close', () => finish(timeout));
-			socket.on('open', () => socket.send(JSON.stringify({ id: 1, method, params })));
+			const timer = setTimeout(() => finish(unavailable), timeoutMs);
+			socket.on('error', () => finish(unavailable));
+			socket.on('close', () => finish(unavailable));
+			const send: BrowserCommand = <Result>(method: string, params: object) => new Promise<Result>((resolve, reject) => {
+				if (socket.readyState !== WebSocket.OPEN || pending) {
+					reject(unavailable);
+					return;
+				}
+				pending = { resolve: value => resolve(value as Result), reject };
+				socket.send(JSON.stringify({ id: ++nextId, method, params }));
+			});
+			socket.on('open', () => void run(send).then(result => finish(null, result), () => finish(unavailable)));
 			socket.on('message', data => {
 				try {
 					const message = JSON.parse(data.toString());
-					if (message.id === 1) {
-						finish(message.error ? timeout : null, message.result);
-					}
+					if (!pending || message.id !== nextId) return;
+					const command = pending;
+					pending = undefined;
+					if (message.error) command.reject(unavailable);
+					else command.resolve(message.result);
 				} catch {
-					finish(timeout);
+					finish(unavailable);
 				}
 			});
 		});
