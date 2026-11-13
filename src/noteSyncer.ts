@@ -8,8 +8,22 @@ import { get } from 'svelte/store';
 import { settingsStore } from './settings';
 import FileManager from './fileManager';
 import MinoteApi from './minoteApi';
+import type ExternalLoginService from './externalLogin';
+import { isEncryptedNoteContent } from './webNote';
 import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
+
+const originalImage = /☺[^\S\r\n]+[^\s<]+|<img\b[^>]*\bfileid=/i;
+
+interface ImportCounts {
+	total: number;
+	count: number;
+	skipped: number;
+	locked: number;
+	failed: number;
+	partial: number;
+	failuresByStep: Record<string, number>;
+}
 
 export default class NoteSyncer {
 	private fileManager: FileManager;
@@ -21,40 +35,34 @@ export default class NoteSyncer {
 	private lastSyncedFolders: Record<string, SyncInfo> = {};
 	private lastSyncedNotes: Record<string, SyncInfo> = {};
 
-	constructor(fileManager: FileManager, minoteApi: MinoteApi) {
+	constructor(fileManager: FileManager, minoteApi: MinoteApi, private readonly externalLogin: ExternalLoginService) {
 		this.fileManager = fileManager;
 		this.minoteApi = minoteApi;
 	}
 
-	public async sync(force = false) {
+	public async sync(force: boolean, onProgress: (result: ImportCounts) => void) {
 		this.clear();
 
-		if (force) {
-			settingsStore.actions.clearLastTimeSynced();
-		}
-
-		// 加载上次同步信息
-		this.lastSyncedFolders= get(settingsStore).lastTimeSynced
+		const settings = get(settingsStore);
+		const history = settings.lastImportDestination === this.fileManager.destination ? settings.lastTimeSynced : [];
+		this.lastSyncedFolders = history
 			.filter(note => note.type === 'folder')
 			.reduce((acc: Record<string, SyncInfo>, note: SyncInfo) => {
-				acc[note.id] = note;
+				acc[note.id] = { ...note };
 				return acc;
 			}, {});
-		this.lastSyncedNotes = get(settingsStore).lastTimeSynced
+		this.lastSyncedNotes = history
 			.filter(note => note.type === 'note')
 			.reduce((acc: Record<string, SyncInfo>, note: SyncInfo) => {
-				acc[note.id] = note;
+				acc[note.id] = { ...note };
 				return acc;
 			}, {});
 
 		await this.fetchNotesAndFolders();
 		await this.createFolders();
-		const count = await this.syncNotes();
+		const result = await this.syncNotes(force, onProgress);
 
-		// 更新上次同步信息
-		settingsStore.actions.setLastTimeSynced(this.thisTimeSynced);
-
-		return count;
+		return { ...result, synced: this.thisTimeSynced };
 	}
 
 	private clear() {
@@ -65,31 +73,44 @@ export default class NoteSyncer {
 	}
 
 	private async fetchNotesAndFolders() {
+		const seenNotes = new Set<string>();
+		const seenFolders = new Set<string>();
+		const pageTokens = new Set<string>();
 		// 获取第一页
 		let page = await this.minoteApi.fetchPage();
 		while (true) {
 			for (const entry of page.data.entries) {
 				if (entry.type === 'note') {
+					const id = String(entry.id);
+					if (seenNotes.has(id)) continue;
+					seenNotes.add(id);
 					// 解析笔记
 					let title = '';
 					if (entry.extraInfo) {
-						const extra = JSON.parse(entry.extraInfo);
-						title = extra.title || '';
+						try {
+							const extra = JSON.parse(entry.extraInfo);
+							if (typeof extra?.title === 'string') title = extra.title;
+						} catch {
+							// Older entries can have incomplete metadata. Use their snippet.
+						}
 					}
+					const encrypted = Boolean(entry.encryptInfo) || (typeof entry.snippet === 'string' && isEncryptedNoteContent(entry.snippet));
 					if (!title) {
-						title = entry.snippet.split('\n')[0] + `_${entry.id}`;
+						const firstLine = !encrypted && typeof entry.snippet === 'string' ? entry.snippet.split('\n')[0] : '';
+						title = `${firstLine || '未命名笔记'}_${entry.id}`;
 					}
 					// 去除标题中的HTML标签
 					title = title.replace(/<[^>]+>/g, '');
 					// 去除标题中的非法字符 \/:*?"<>| 和换行符
-					title = title.replace(/[\\\/:*?"<>|\n]/g, '');
+					title = this.safeName(title);
 
 					const note: Note = {
-						id: entry.id,
+						id,
 						title,
 						createDate: entry.createDate,
 						modifyDate: entry.modifyDate,
-						folderId: entry.folderId.toString(),
+						folderId: String(entry.folderId ?? '0'),
+						encrypted,
 					};
 					this.notes.push(note);
 				}
@@ -97,11 +118,13 @@ export default class NoteSyncer {
 
 			for (const entry of page.data.folders) {
 				if (entry.type === 'folder') {
+					const id = String(entry.id);
+					if (id === '0' || seenFolders.has(id)) continue;
+					seenFolders.add(id);
 					// 解析文件夹
 					const folder: Folder = {
-						id: entry.id.toString(),
-						name: entry.subject,
-						createDate: entry.createDate,
+						id,
+						name: this.safeName(entry.subject) || '未命名分类',
 					};
 					this.folders.push(folder);
 				}
@@ -113,41 +136,46 @@ export default class NoteSyncer {
 			}
 
 			// 获取下一页
-			page = await this.minoteApi.fetchPage(page.data.syncTag);
+			const token = page.data.syncTag;
+			if (typeof token !== 'string' || !token || pageTokens.has(token)) {
+				throw new Error('Xiaomi Notes pagination stopped advancing');
+			}
+			pageTokens.add(token);
+			page = await this.minoteApi.fetchPage(token);
 		}
 	}
 
 	private async createFolders() {
 		// 添加默认文件夹
-		this.folders.push({ id: '0', name: '未分类', createDate: Date.now() });
+		this.folders.unshift({ id: '0', name: '未分类' });
 
+		const usedNames = new Set<string>();
+		// Reserve the default category before allocating names for cloud folders.
 		for (const folder of this.folders) {
+			const base = folder.name;
+			for (let index = 2; usedNames.has(this.pathKey(folder.name)); index++) {
+				folder.name = `${base} (${index})`;
+			}
+			usedNames.add(this.pathKey(folder.name));
 			// 更新文件夹字典
 			this.folderDict[folder.id] = folder.name;
 
 			// 如果上次曾同步过
 			if (folder.id in this.lastSyncedFolders) {
 				const oldFolderName = this.lastSyncedFolders[folder.id].name;
-				if (folder.name !== oldFolderName) {
-					// 重命名文件夹
-					await this.fileManager.renameFolder(oldFolderName, folder.name);
-					this.lastSyncedFolders[folder.id].name = folder.name;
+				if (folder.name !== oldFolderName && await this.fileManager.renameFolder(oldFolderName, folder.name)) {
 					// 更新笔记路径
 					for (const note of Object.values(this.lastSyncedNotes)) {
-						if (note.relativePath && note.relativePath.startsWith(oldFolderName + path.sep)) {
-							note.relativePath = note.relativePath.replace(oldFolderName, folder.name);
+						const relativePath = note.relativePath.replace(/\\/g, '/');
+						if (relativePath.startsWith(oldFolderName + '/')) {
+							note.relativePath = folder.name + relativePath.slice(oldFolderName.length);
 						}
 					}
 				}
-
-				// 添加到已处理文件夹列表
-				this.lastSyncedFolders[folder.id].syncTime = Date.now();
-				this.thisTimeSynced.push(this.lastSyncedFolders[folder.id]);
-				continue;
 			}
 
 			// 创建文件夹目录
-			await this.fileManager.createFolder(folder.name, folder.createDate);
+			await this.fileManager.createFolder(folder.name);
 
 			// 添加到已处理文件夹列表
 			this.thisTimeSynced.push({
@@ -160,60 +188,71 @@ export default class NoteSyncer {
 		}
 	}
 
-	private async syncNotes() {
-		let syncedCount = 0;
+	private async syncNotes(force: boolean, onProgress: (result: ImportCounts) => void) {
+		const result: ImportCounts = {
+			total: this.notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, failuresByStep: {}
+		};
+		onProgress(result);
 
 		// 记录此次同步信息
 		for (const note of this.notes) {
+			const previous = this.lastSyncedNotes[note.id];
+			let step = '检查本地文件';
 			try {
-				// 如果笔记未修改则跳过
-				if (note.id in this.lastSyncedNotes && note.modifyDate <= this.lastSyncedNotes[note.id].syncTime) {
-					// 添加到已处理笔记列表
-					this.thisTimeSynced.push(this.lastSyncedNotes[note.id]);
+				const folderPath = this.folderDict[note.folderId] || '未分类';
+				const unchanged = !force && previous && note.modifyDate <= previous.syncTime;
+				const checked = unchanged && await this.checkPreviousNote(note, previous, folderPath);
+				if (checked) {
+					this.thisTimeSynced.push({ ...previous, decoded: previous.decoded ?? false, imageFormatChecked: true });
+					result.skipped++;
 					continue;
 				}
 
-				const folderName = this.folderDict[note.folderId];
-				const folderPath = folderName;
-
-				// 删除旧笔记
-				if (note.id in this.lastSyncedNotes) {
-					await this.fileManager.deleteFile(this.lastSyncedNotes[note.id].relativePath);
-				}
-
-				// 获取笔记内容
+				step = '读取云端正文';
 				const noteDetails = await this.minoteApi.fetchNoteDetails(note.id);
-
-				// 处理图片
-				const imgDict: Record<string, string> = {};
-				const downloadPromises: Promise<void>[] = [];
-
-				if (noteDetails.data.entry.setting?.data) {
-					const images: ImageInfo[] = [];
-					for (const img of noteDetails.data.entry.setting.data) {
-						const fileId = img.fileId;
-						const fileType = img.mimeType.replace('image/', '');
-						images.push({ fileId, fileType });
-						imgDict[fileId] = fileType;
+				const entry = noteDetails.data?.entry;
+				if (typeof entry?.content !== 'string') {
+					throw new Error('Missing note content');
+				}
+				const encrypted = note.encrypted || Boolean(entry.encryptInfo) || isEncryptedNoteContent(entry.content);
+				let content: string | null = encrypted && entry.content ? await this.externalLogin.readEncryptedNote(note.id) : entry.content;
+				if (content === null || (encrypted && entry.content && (content === entry.content || isEncryptedNoteContent(content)))) {
+					result.locked++;
+					if (previous) {
+						this.thisTimeSynced.push(previous);
 					}
-
-					// 创建图片目录
-					const imgDir = path.join(folderPath, 'img');
-					await this.fileManager.createFolder(imgDir, Date.now());
-
-					// 并行下载图片
-					for (const img of images) {
-						const imgPath = path.join(imgDir, `${img.fileId}.${img.fileType}`);
-						downloadPromises.push(this.downloadImage(img.fileId, imgPath));
-					}
+					continue;
 				}
 
-				// 等待所有图片下载完成
-				await Promise.all(downloadPromises);
+				step = '处理图片';
+				const images: ImageInfo[] = [];
+				const imgDict = new Map<string, string>();
+				let attachmentsPending = false;
+				const attachments = entry.setting?.data;
+				for (const attachment of Array.isArray(attachments) ? attachments : []) {
+					const mime = typeof attachment?.mimeType === 'string' ? attachment.mimeType.toLowerCase() : '';
+					const fileId = String(attachment?.fileId ?? '');
+					if (!mime.startsWith('image/') || !fileId) continue;
+					const subtype = mime.slice(6).split(/[+;]/)[0];
+					images.push({
+						fileId, fileType: /^[a-z0-9]+$/.test(subtype) ? subtype : 'img',
+						digest: typeof attachment.digest === 'string' ? attachment.digest : undefined
+					});
+				}
+				for (const image of images) {
+					const imgDir = path.join(folderPath, 'img');
+					const safeId = /^[a-zA-Z0-9_-]+$/.test(image.fileId) ? image.fileId : '~' + Buffer.from(image.fileId).toString('hex');
+					const fileName = `${this.safeName(safeId)}.${image.fileType}`;
+					try {
+						await this.fileManager.createFolder(imgDir);
+						await this.downloadImage(image, path.join(imgDir, fileName), encrypted);
+						imgDict.set(image.fileId, fileName);
+					} catch {
+						attachmentsPending = true;
+					}
+				}
 
 				// 转换内容
-				let content = noteDetails.data.entry.content;
-
 				// 规则1: 移除<text>标签
 				content = content.replace(/<text[^>]*>(.*?)<\/text>/g, '$1');
 
@@ -224,48 +263,105 @@ export default class NoteSyncer {
 				);
 
 				// 规则3: 转换图片行 (☺格式)
-				content = content.replace(/☺\s+([^<]+)(<0\/><\/>)?/gm, (match: any, fileId: any) => {
-					return fileId in imgDict ? `![](img/${fileId}.${imgDict[fileId]})` : match;
+				content = content.replace(/☺[^\S\r\n]+([^\s<]+)(?:<0\/><\/>)?/g, (match, fileId: string) => {
+					return imgDict.has(fileId) ? `![](img/${imgDict.get(fileId)})` : match;
 				});
 
 				// 规则4: 转换图片行 (<img>格式)
 				content = content.replace(
-					/<img fileid="([^"]+)" imgshow="0" imgdes="" \/>/g, (match: any, fileId: any) => {
-						return fileId in imgDict ? `![](img/${fileId}.${imgDict[fileId]})` : match;
+					/<img\b[^>]*\bfileid=["']([^"']+)["'][^>]*>/gi, (match, fileId: string) => {
+						return imgDict.has(fileId) ? `![](img/${imgDict.get(fileId)})` : match;
 					}
 				);
 
 				// 规则5: 移除<new-format/>标签
 				content = content.replace(/<new-format\/>/g, '');
+				attachmentsPending ||= originalImage.test(content);
 
 				// 保存转换后的内容
-				const notePath = path.join(folderPath, `${note.title}.md`);
+				step = '写入本地文件';
+				const notePath = await this.resolveNotePath(folderPath, note, encrypted, previous);
 				await this.fileManager.saveFile(notePath, content, note.createDate, note.modifyDate);
+				if (previous && this.pathKey(previous.relativePath) !== this.pathKey(notePath)
+					&& !Object.values(this.lastSyncedNotes).some(item => item.id !== note.id && this.pathKey(item.relativePath) === this.pathKey(previous.relativePath))) {
+					await this.fileManager.deleteFile(previous.relativePath).catch(() => undefined);
+				}
 
-				syncedCount++;
+				result.count++;
+				if (attachmentsPending) result.partial++;
 				// 添加到已处理笔记列表
 				this.thisTimeSynced.push({
 					id: note.id,
 					type: 'note',
 					name: note.title,
 					relativePath: notePath,
-					syncTime: note.modifyDate
+					syncTime: note.modifyDate,
+					decoded: encrypted,
+					imageFormatChecked: true,
+					attachmentsPending
 				});
-			} catch (err) {
-				console.error('[minote-importer] sync MI note error: ', note, err);
-				continue;
+			} catch {
+				result.failed++;
+				result.failuresByStep[step] = (result.failuresByStep[step] || 0) + 1;
+				if (previous) {
+					this.thisTimeSynced.push(previous);
+				}
+			} finally {
+				onProgress(result);
 			}
 		}
 
-		return syncedCount
+		return result;
 	}
 
-	private async downloadImage(fileId: string, imgPath: string) {
-		if (await this.fileManager.exists(imgPath)) {
+	private async checkPreviousNote(note: Note, previous: SyncInfo, folder: string): Promise<boolean> {
+		const relativePath = previous.relativePath.replace(/\\/g, '/');
+		if (this.pathKey(path.posix.dirname(relativePath)) !== this.pathKey(folder)
+			|| !await this.fileManager.exists(previous.relativePath)) return false;
+		if (note.encrypted && previous.decoded !== true) return false;
+		if (previous.attachmentsPending) return false;
+		if (previous.imageFormatChecked && previous.decoded !== undefined) return true;
+		const content = await this.fileManager.readFile(previous.relativePath);
+		return !isEncryptedNoteContent(content) && !originalImage.test(content);
+	}
+
+	private async resolveNotePath(folder: string, note: Note, encrypted: boolean, previous?: SyncInfo): Promise<string> {
+		const occupied = new Set([...Object.values(this.lastSyncedNotes), ...this.thisTimeSynced]
+			.filter(item => item.type === 'note' && item.id !== note.id)
+			.map(item => this.pathKey(item.relativePath)));
+		if (encrypted && previous && this.pathKey(path.dirname(previous.relativePath)) === this.pathKey(folder)
+			&& !occupied.has(this.pathKey(previous.relativePath))) {
+			return previous.relativePath;
+		}
+		let stem = '';
+		for (const char of note.title || '未命名笔记') {
+			if (Buffer.byteLength(stem + char, 'utf8') > 180) break;
+			stem += char;
+		}
+		let candidate = path.join(folder, `${stem}.md`);
+		const owns = (value: string) => previous && this.pathKey(previous.relativePath) === this.pathKey(value);
+		for (let index = 1; occupied.has(this.pathKey(candidate)) || (!owns(candidate) && await this.fileManager.exists(candidate)); index++) {
+			candidate = path.join(folder, `${stem}_${this.safeName(note.id)}_${index}.md`);
+		}
+		return candidate;
+	}
+
+	private safeName(value: string): string {
+		const name = value.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').trim().replace(/[. ]+$/, '');
+		return /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(name) ? '_' + name : name;
+	}
+
+	private pathKey(value: string): string {
+		return value.replace(/\\/g, '/').normalize('NFC').toLowerCase();
+	}
+
+	private async downloadImage(image: ImageInfo, imgPath: string, encrypted: boolean) {
+		if (await this.fileManager.hasBinaryFile(imgPath)) {
 			return;
 		}
-
-		const imgBinary = await this.minoteApi.fetchImage(fileId);
+		const webImage = await this.externalLogin.readImage(image);
+		if (!webImage && encrypted) throw new Error('Encrypted image unavailable');
+		const imgBinary = webImage ?? await this.minoteApi.fetchImage(image.fileId);
 		await this.fileManager.saveBinaryFile(imgPath, imgBinary);
 	}
 }

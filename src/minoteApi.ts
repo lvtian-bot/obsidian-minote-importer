@@ -76,11 +76,15 @@ export default class MinoteApi {
 
 	async fetchImage(fileId: string) {
 		const req: RequestUrlParam = {
-			url: this.getBaseUrl() + `/file/full?type=note_img&fileid=${fileId}`,
+			url: this.getBaseUrl() + `/file/full?type=note_img&fileid=${encodeURIComponent(fileId)}`,
 			method: 'GET',
 			headers: this.getHeaders()
 		};
 		const resp = await requestUrl(req);
+		const type = Object.entries(resp.headers).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+		if (!resp.arrayBuffer.byteLength || /(?:json|text\/html)/i.test(type || '')) {
+			throw new Error('Image download did not return an attachment');
+		}
 		return resp.arrayBuffer;
 	}
 }

@@ -3,6 +3,7 @@
  * @author Emac
  */
 import { writable } from 'svelte/store';
+import { normalizePath } from 'obsidian';
 
 import MinotePlugin from 'main';
 import type { SyncInfo } from './models';
@@ -12,8 +13,11 @@ interface MinotePluginSettings {
 	host: string;
 	cookie: string;
 	isCookieValid: boolean;
+	webLoginConfirmed: boolean;
 	user: string;
 	lastTimeSynced: SyncInfo[];
+	lastImportDestination: string;
+	lastImportSummary: string;
 	// 外部浏览器登录
 	browserPath: string;
 };
@@ -23,8 +27,11 @@ const DEFAULT_SETTINGS: MinotePluginSettings = {
 	host: 'i.mi.com',
 	cookie: '',
 	isCookieValid: false,
+	webLoginConfirmed: false,
 	user: '',
 	lastTimeSynced: [],
+	lastImportDestination: '',
+	lastImportSummary: '',
 	browserPath: '',
 };
 
@@ -38,6 +45,16 @@ const createSettingsStore = () => {
 
 		const data = Object.assign({}, DEFAULT_SETTINGS, await plugin.loadData());
 		const settings: MinotePluginSettings = { ...data };
+		settings.noteLocation = normalizePath(settings.noteLocation);
+		if (!settings.lastImportDestination && settings.lastTimeSynced.length) {
+			// Legacy records have relative paths. Recheck them under the saved destination.
+			settings.lastImportDestination = settings.noteLocation;
+		}
+		if (!settings.webLoginConfirmed) {
+			settings.cookie = '';
+			settings.isCookieValid = false;
+			settings.user = '';
+		}
 		store.set(settings);
 	};
 
@@ -49,10 +66,7 @@ const createSettingsStore = () => {
 	});
 
 	const setNoteLocationFolder = (value: string) => {
-		store.update((state) => {
-			state.noteLocation = value;
-			return state;
-		});
+		store.update(state => ({ ...state, noteLocation: normalizePath(value) }));
 	};
 
 	const setHost = (value: string) => {
@@ -61,6 +75,7 @@ const createSettingsStore = () => {
 				state.host = value;
 				state.cookie = '';
 				state.isCookieValid = false;
+				state.webLoginConfirmed = false;
 				state.user = '';
 			}
 			return state;
@@ -71,6 +86,7 @@ const createSettingsStore = () => {
 		store.update((state) => {
 			state.cookie = '';
 			state.isCookieValid = false;
+			state.webLoginConfirmed = false;
 			state.user = '';
 			return state;
 		});
@@ -80,6 +96,7 @@ const createSettingsStore = () => {
 		store.update((state) => {
 			state.cookie = cookie;
 			state.isCookieValid = true;
+			state.webLoginConfirmed = true;
 			state.user = user;
 			return state;
 		});
@@ -92,18 +109,12 @@ const createSettingsStore = () => {
 		});
 	};
 
-	const clearLastTimeSynced = () => {
-		store.update((state) => {
-			state.lastTimeSynced = [];
-			return state;
-		});
-	};
-
-	const setLastTimeSynced = (synced: SyncInfo[]) => {
-		store.update((state) => {
-			state.lastTimeSynced = synced;
-			return state;
-		});
+	const setImportResult = (destination: string, summary: string, synced?: SyncInfo[]) => {
+		store.update(state => ({
+			...state,
+			lastImportSummary: summary,
+			...(synced ? { lastImportDestination: destination, lastTimeSynced: synced } : {}),
+		}));
 	};
 
 	return {
@@ -115,10 +126,10 @@ const createSettingsStore = () => {
 			clearCookie,
 			setLogin,
 			setBrowserPath,
-			clearLastTimeSynced,
-			setLastTimeSynced,
+			setImportResult,
 		}
 	}
 };
 
 export const settingsStore = createSettingsStore()
+export const importProgress = writable('');

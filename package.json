@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-minote-importer",
-	"version": "0.1.9",
+	"version": "0.1.14",
 	"description": "将小米云笔记单向导入 Obsidian，保存为 Markdown 文件。",
 	"main": "main.js",
 	"scripts": {

@@ -1,15 +1,6 @@
-/**
- * @file 外部浏览器自动登录服务
- *
- * 原理：
- * 1. 启动一个使用独立用户目录的 Chrome/Edge（带 CDP 远程调试端口）；
- * 2. 在外部浏览器中正常登录小米账号；
- * 3. 插件通过 CDP 轮询浏览器的 Cookie 库（能拿到 HttpOnly Cookie）；
- * 4. 用拿到的 Cookie 请求 i.mi.com 的 profile 接口验证登录；
- * 5. 验证成功后自动保存 Cookie 并关闭调试浏览器。
- */
+/** 外部浏览器登录及小米云网页版笔记读取，源自 Halo0sama 的登录修复。 */
 import { Notice, requestUrl } from 'obsidian';
-import { get } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import fs from 'fs';
 import { createHash } from 'crypto';
@@ -18,13 +9,16 @@ import path from 'path';
 import WebSocket from 'ws';
 
 import MinoteApi from './minoteApi';
+import { readWebNote } from './webNote';
 import { settingsStore } from './settings';
 
 export interface LoginResult {
 	success: boolean;
-	cancelled?: boolean;
 	message: string;
 }
+
+type BrowserSession = { host: string; portFile: string; confirmed: boolean };
+type LoginStatus = 'idle' | 'waiting' | 'confirmed' | 'closed' | 'timed-out';
 
 interface CdpTarget {
 	id: string;
@@ -39,25 +33,19 @@ interface CdpCookie {
 	value: string;
 }
 
-interface CdpResponse {
-	id?: number;
-	result?: {
-		cookies?: CdpCookie[];
-	};
-	error?: { message?: string };
-}
-
-const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const POLL_INTERVAL_MS = 1500;
-const PROFILE_RETRY_INTERVAL_MS = 10_000;
+const LOGIN_TIMEOUT_MS = 5 * 60_000;
+const LOGIN_POLL_MS = 2_000;
+const PROFILE_RETRY_MS = 10_000;
 
 export default class ExternalLoginService {
+	readonly loginStatus = writable<LoginStatus>('idle');
 	private child: ChildProcess | null = null;
 	private childExited = false;
-	private childExitedAt = 0;
-	private cancelled = false;
 	private running = false;
-	private forcedNavigation = new Set<string>();
+	private session: BrowserSession | null = null;
+	private loginTimer?: ReturnType<typeof setTimeout>;
+	private loginDeadline = 0;
+	private nextProfileCheck = 0;
 	private readonly api = new MinoteApi();
 	private readonly profileRoot: string;
 	private readonly profileDir: string;
@@ -73,19 +61,187 @@ export default class ExternalLoginService {
 		return this.running;
 	}
 
-	/**
-	 * 在外部浏览器中登录（打开二维码登录页）。
-	 */
 	async startLogin(): Promise<LoginResult> {
-		return this.runFlow('https://account.xiaomi.com/fe/service/login/qrcode');
+		if (this.running) {
+			return { success: false, message: '正在验证登录，请稍候' };
+		}
+		const host = get(settingsStore).host;
+		if (!['i.mi.com', 'eu.i.mi.com', 'us.i.mi.com', 'in.i.mi.com'].includes(host)) {
+			return { success: false, message: '请选择有效的小米云服务域名' };
+		}
+		const existing = this.session;
+		if (existing?.host === host && !this.childExited) {
+			try {
+				const target = await this.findNotePage(existing);
+				if (target) await this.sendCommand(target, 'Page.bringToFront', {});
+			} catch {
+				// An existing browser window can still be selected by the user.
+			}
+			if (!this.isCurrent(existing)) {
+				return { success: false, message: '小米云窗口已关闭，请重新打开。' };
+			}
+			if (get(this.loginStatus) !== 'waiting') {
+				this.watchLogin(existing);
+			}
+			return { success: true, message: '请在已打开的小米云窗口完成验证，Obsidian 会自动识别。' };
+		}
+		this.dispose();
+		try {
+			const browserPath = this.detectBrowserPath();
+			if (!browserPath) {
+				return { success: false, message: '未找到 Chrome 或 Edge，请在高级设置中指定浏览器路径' };
+			}
+			this.ensureProfileDir();
+			const portFile = path.join(this.profileDir, 'DevToolsActivePort');
+			fs.rmSync(portFile, { force: true });
+			const child = spawn(browserPath, [
+				'--remote-debugging-port=0',
+				'--remote-debugging-address=127.0.0.1',
+				`--user-data-dir=${this.profileDir}`,
+				'--no-first-run',
+				'--no-default-browser-check',
+				`--app=https://${host}/note/h5#/`,
+				'--window-size=960,720'
+			], { stdio: 'ignore' });
+			this.child = child;
+			this.childExited = false;
+			const onExit = () => {
+				if (this.child === child) {
+					this.childExited = true;
+					clearTimeout(this.loginTimer);
+					this.loginStatus.set('closed');
+				}
+			};
+			child.once('error', onExit);
+			child.once('exit', onExit);
+			this.session = { host, portFile, confirmed: false };
+			this.watchLogin(this.session);
+			return { success: true, message: '请在小米云网页完成验证。看到 Obsidian 显示已登录后，即可导入笔记。' };
+		} catch {
+			return { success: false, message: '无法启动专用浏览器，请检查浏览器设置后重试' };
+		}
 	}
 
-	/**
-	 * 刷新 Cookie。如果独立浏览器目录里还保持着登录状态，
-	 * 会自动直接抓取；否则会打开登录页等待用户登录。
-	 */
-	async startRefreshCookie(): Promise<LoginResult> {
-		return this.runFlow(`https://${get(settingsStore).host}/note/h5`);
+	private watchLogin(session: BrowserSession): void {
+		clearTimeout(this.loginTimer);
+		session.confirmed = false;
+		this.loginDeadline = Date.now() + LOGIN_TIMEOUT_MS;
+		this.nextProfileCheck = 0;
+		this.loginStatus.set('waiting');
+		this.loginTimer = setTimeout(() => void this.pollLogin(session), LOGIN_POLL_MS);
+	}
+
+	private async pollLogin(session: BrowserSession): Promise<void> {
+		if (!this.isCurrent(session)) return;
+		if (Date.now() >= this.loginDeadline) {
+			this.loginStatus.set('timed-out');
+			return;
+		}
+		try {
+			if (Date.now() >= this.nextProfileCheck) {
+				const result = await this.confirmLogin(false);
+				if (result.success) new Notice(result.message);
+			}
+		} finally {
+			if (this.isCurrent(session) && !session.confirmed) {
+				this.loginTimer = setTimeout(() => void this.pollLogin(session), LOGIN_POLL_MS);
+			}
+		}
+	}
+
+	async confirmLogin(manual = true): Promise<LoginResult> {
+		const session = this.session;
+		if (!session || !this.isCurrent(session)) {
+			return { success: false, message: '请重新打开小米云网页，保持窗口打开后再确认。' };
+		}
+		if (this.running) {
+			return { success: false, message: '正在检查小米云登录状态，请稍候。' };
+		}
+		if (session.confirmed) {
+			return { success: true, message: '小米云已登录，可以导入笔记。' };
+		}
+		this.running = true;
+		try {
+			const target = await this.findNotePage(session);
+			if (!target || !await this.notesPageReady(target, session.host, manual) || !this.isCurrent(session)) {
+				return { success: false, message: '请在小米云网页完成设备验证，打开笔记页面后再确认。' };
+			}
+			const { cookies } = await this.sendCommand<{ cookies: CdpCookie[] }>(target, 'Network.getCookies', {
+				urls: [`https://${session.host}/`, `https://${session.host}/status/lite/profile`, `https://${session.host}/note/note/`]
+			});
+			const header = cookies.map(({ name, value }) => `${name}=${value}`).join('; ');
+			if (!header || !this.isCurrent(session)) {
+				return { success: false, message: '尚未读到小米云登录会话，请保持网页打开并重试。' };
+			}
+			this.nextProfileCheck = Date.now() + PROFILE_RETRY_MS;
+			const profile = await this.api.checkProfile(session.host, header);
+			if (!profile.ok) {
+				return { success: false, message: '小米云未接受当前登录会话，请在网页重新登录后再确认。' };
+			}
+			if (!this.isCurrent(session) || !await this.notesPageReady(target, session.host, manual) || !this.isCurrent(session)) {
+				return { success: false, message: '笔记网页已关闭或仍在验证，请保持网页打开后重试。' };
+			}
+			session.confirmed = true;
+			clearTimeout(this.loginTimer);
+			settingsStore.actions.setLogin(header, profile.nickname || '小米账号');
+			this.loginStatus.set('confirmed');
+			return { success: true, message: 'Minote Importer：小米云已登录，可以导入笔记。' };
+		} catch {
+			return { success: false, message: '暂时无法连接小米云网页，请保持插件打开的窗口并重试。' };
+		} finally {
+			this.running = false;
+		}
+	}
+
+	private isCurrent(session: BrowserSession): boolean {
+		return this.session === session && !this.childExited && session.host === get(settingsStore).host;
+	}
+
+	private async notesPageReady(target: string, host: string, manual: boolean): Promise<boolean> {
+		// The manual action confirms the user can see the note. Automatic detection also checks the rendered layout.
+		const page = await this.sendCommand<{ result?: { value?: boolean } }>(target, 'Runtime.evaluate', {
+			expression: `location.origin === ${JSON.stringify(`https://${host}`)} &&
+				/^\\/note(?:\\/h5)?\\/?$/.test(location.pathname) &&
+				!document.querySelector('.e2ee-captcha-input input, #refresh_modal_confirm') &&
+				(${manual} || [...document.querySelectorAll('[class*="note-list-"]')].some(list => list.getClientRects().length > 0))`,
+			returnByValue: true
+		});
+		return page.result?.value === true;
+	}
+
+	async readEncryptedNote(noteId: string): Promise<string | null> {
+		return this.readNotesPage([noteId]);
+	}
+
+	async readImage(image: { fileId: string; digest?: string }): Promise<ArrayBuffer | null> {
+		const result = await this.readNotesPage(['', image], 45000, 64 * 1024 * 1024);
+		if (!result) return null;
+		const bytes = Buffer.from(result, 'base64');
+		return Uint8Array.from(bytes).buffer;
+	}
+
+	private async readNotesPage(args: [string, { fileId: string; digest?: string }?], timeoutMs?: number, maxPayload?: number): Promise<string | null> {
+		const session = this.session;
+		if (!session?.confirmed || session.host !== get(settingsStore).host) {
+			return null;
+		}
+		try {
+			const target = await this.findNotePage(session);
+			if (!target) {
+				return null;
+			}
+			const evaluated = await this.sendCommand<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
+				target, 'Runtime.evaluate', {
+					expression: `(${readWebNote.toString()})(...${JSON.stringify([session.host, ...args])})`,
+					awaitPromise: true,
+					returnByValue: true
+				}, timeoutMs, maxPayload
+			);
+			const content = evaluated.result?.value;
+			return this.session === session && !evaluated.exceptionDetails && typeof content === 'string' ? content : null;
+		} catch {
+			return null;
+		}
 	}
 
 	async logout(): Promise<void> {
@@ -95,6 +251,7 @@ export default class ExternalLoginService {
 		}
 		this.running = true;
 		settingsStore.actions.clearCookie();
+		this.dispose();
 		try {
 			await this.clearBrowserProfile();
 		} finally {
@@ -113,309 +270,57 @@ export default class ExternalLoginService {
 	}
 
 	dispose(): void {
-		this.cancelled = true;
+		clearTimeout(this.loginTimer);
+		this.session = null;
 		this.stopBrowser();
+		this.loginStatus.set('idle');
 	}
 
-	private async runFlow(url: string): Promise<LoginResult> {
-		if (this.running) {
-			return { success: false, message: '登录流程正在进行中，请稍候' };
+	private async findNotePage(session: { host: string; portFile: string }): Promise<string | null> {
+		const port = this.readDebugPort(session.portFile);
+		if (!port || this.childExited) {
+			return null;
 		}
-
-		this.running = true;
-		this.cancelled = false;
-		this.forcedNavigation.clear();
-		try {
-			const browserPath = this.detectBrowserPath();
-			if (!browserPath) {
-				return {
-					success: false,
-					message: '未找到 Chrome/Edge/Chromium，请在插件高级设置里手动指定浏览器路径'
-				};
-			}
-
-			const host = get(settingsStore).host;
-			if (!['i.mi.com', 'eu.i.mi.com', 'us.i.mi.com', 'in.i.mi.com'].includes(host)) {
-				return { success: false, message: '请选择有效的小米云服务域名' };
-			}
-			this.ensureProfileDir();
-
-			const portFile = path.join(this.profileDir, 'DevToolsActivePort');
-			fs.rmSync(portFile, { force: true });
-			const child = spawn(
-				browserPath,
-				[
-					'--remote-debugging-port=0',
-					'--remote-debugging-address=127.0.0.1',
-					`--user-data-dir=${this.profileDir}`,
-					'--no-first-run',
-					'--no-default-browser-check',
-					'--disable-infobars',
-					'--disable-session-crashed-bubble',
-					`--app=${url}`,
-					'--window-size=960,720'
-				],
-				{ stdio: 'ignore' }
-			);
-			this.child = child;
-			this.childExited = false;
-			this.childExitedAt = 0;
-
-			child.once('error', (err) => {
-				console.error('[minote-importer] failed to start browser', (err as NodeJS.ErrnoException).code);
-				this.childExited = true;
-				this.childExitedAt = Date.now();
-			});
-
-			child.once('exit', () => {
-				this.childExited = true;
-				this.childExitedAt = Date.now();
-			});
-
-			new Notice('Minote Importer：请在打开的浏览器窗口中完成小米账号登录');
-
-			return await this.waitForValidCookie(portFile, host);
-		} catch {
-			return { success: false, message: '无法启动专用浏览器，请关闭登录窗口或检查浏览器设置后重试' };
-		} finally {
-			this.running = false;
-			this.stopBrowser();
-		}
+		const response = await requestUrl({ url: `http://127.0.0.1:${port}/json` });
+		const targets: CdpTarget[] = response.json;
+		const page = Array.isArray(targets) && targets.find(target => {
+			if (target.type !== 'page' || typeof target.url !== 'string' || !target.url.startsWith('https://')) return false;
+			const url = new URL(target.url);
+			return url.origin === `https://${session.host}`
+				&& /^\/note(?:\/h5)?\/?$/.test(url.pathname)
+				&& target.webSocketDebuggerUrl?.startsWith(`ws://127.0.0.1:${port}/devtools/page/`);
+		});
+		return page && page.webSocketDebuggerUrl || null;
 	}
 
-	private async waitForValidCookie(portFile: string, host: string): Promise<LoginResult> {
-		const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-		let lastCheckedCookie = '';
-		let lastCheckedAt = 0;
-
-		while (Date.now() < deadline) {
-			if (this.cancelled) {
-				return { success: false, cancelled: true, message: '已取消登录' };
-			}
-
-			// 浏览器进程提前退出（例如配置目录被旧进程占用）时快速失败，
-			// 不要傻等 5 分钟。
-			if (this.childExited && Date.now() - this.childExitedAt > 5000) {
-				return {
-					success: false,
-					message: '浏览器进程意外退出。可能已有一个使用相同配置目录的浏览器实例，请关闭后重试'
-				};
-			}
-
-			try {
-				const port = this.readDebugPort(portFile);
-				const targets = port ? await this.fetchTargets(port) : [];
-				for (const target of targets) {
-					if (target.type !== 'page' || !target.webSocketDebuggerUrl?.startsWith(`ws://127.0.0.1:${port}/devtools/page/`)) {
-						continue;
-					}
-
-					// 小米账号已经登录成功，但页面停在
-					// account.xiaomi.com/fe/service/account 时，i.mi.com
-					// 的 Cookie 还没有种下。这里复刻原插件的做法：强制把
-					// 这个标签页导航到 i.mi.com/note/h5，完成跨域登录交接。
-					if (
-						target.url.startsWith('https://account.xiaomi.com/fe/service/account?cUserId=') &&
-						!this.forcedNavigation.has(target.id)
-					) {
-						this.forcedNavigation.add(target.id);
-						await this.navigatePage(target, `https://${host}/note/h5`);
-						continue;
-					}
-
-					if (!target.url.startsWith(`https://${host}/`)) {
-						continue;
-					}
-					const cookies = await this.readCookies(target, host);
-					const cookieHeader = this.buildCookieHeader(cookies);
-					if (this.cancelled || !cookieHeader || (cookieHeader === lastCheckedCookie && Date.now() - lastCheckedAt < PROFILE_RETRY_INTERVAL_MS)) {
-						continue;
-					}
-
-					lastCheckedCookie = cookieHeader;
-					lastCheckedAt = Date.now();
-					const profile = await this.api.checkProfile(host, cookieHeader);
-					if (profile.ok && !this.cancelled) {
-						settingsStore.actions.setLogin(cookieHeader, profile.nickname || '小米账号');
-						new Notice('Minote Importer：登录成功');
-						return { success: true, message: '登录成功' };
-					}
-				}
-			} catch {
-				// 浏览器刚启动时，调试端口可能尚未就绪。
-			}
-
-			await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-		}
-
-		return { success: false, message: '等待登录超时（5 分钟），请重试' };
-	}
-
-	private async fetchTargets(port: number): Promise<CdpTarget[]> {
-		try {
-			const resp = await requestUrl({
-				url: `http://127.0.0.1:${port}/json`,
-				method: 'GET',
-				headers: { 'Accept': 'application/json' }
-			});
-			if (resp.status === 200 && Array.isArray(resp.json)) {
-				return resp.json as CdpTarget[];
-			}
-		} catch (err) {
-			// not ready yet
-		}
-		return [];
-	}
-
-	private readCookies(target: CdpTarget, host: string): Promise<CdpCookie[]> {
-		return new Promise((resolve) => {
+	private sendCommand<T>(endpoint: string, method: string, params: object, timeoutMs = 15000, maxPayload = 8 * 1024 * 1024): Promise<T> {
+		return new Promise((resolve, reject) => {
+			const socket = new WebSocket(endpoint, { handshakeTimeout: 4000, maxPayload });
 			let settled = false;
-			let ws: WebSocket | null = null;
-			let nextId = 1;
-			const pending = new Map<number, (msg: CdpResponse) => void>();
-
-			const finish = (cookies: CdpCookie[]) => {
-				if (settled) {
-					return;
-				}
+			const finish = (error: Error | null, result?: T) => {
+				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				try {
-					ws?.terminate();
-				} catch (_) {
-					// ignore
-				}
-				resolve(cookies);
+				socket.terminate();
+				if (error) reject(error);
+				else resolve(result as T);
 			};
-
-			const timer = setTimeout(() => finish([]), 5000);
-
-			try {
-				ws = new WebSocket(target.webSocketDebuggerUrl as string, {
-					handshakeTimeout: 4000,
-					maxPayload: 8 * 1024 * 1024
-				});
-			} catch (_) {
-				finish([]);
-				return;
-			}
-
-			ws.on('open', () => {
-				if (!ws) {
-					finish([]);
-					return;
-				}
-
-				// 打开网络域，确保能读取完整 Cookie（包含 HttpOnly）
-				const enableId = nextId++;
-				ws.send(JSON.stringify({ id: enableId, method: 'Network.enable' }));
-
-				const cookieId = nextId++;
-				pending.set(cookieId, (msg) => {
-					const cookies = (msg?.result?.cookies || []) as CdpCookie[];
-					finish(cookies);
-				});
-				ws.send(
-					JSON.stringify({
-						id: cookieId,
-						method: 'Network.getCookies',
-						params: {
-							urls: [
-								`https://${host}/`,
-								`https://${host}/note/h5`,
-								`https://${host}/status/lite/profile`
-							]
-						}
-					})
-				);
-			});
-
-			ws.on('message', (data: Buffer) => {
+			const timeout = new Error('Browser command unavailable');
+			const timer = setTimeout(() => finish(timeout), timeoutMs);
+			socket.on('error', () => finish(timeout));
+			socket.on('close', () => finish(timeout));
+			socket.on('open', () => socket.send(JSON.stringify({ id: 1, method, params })));
+			socket.on('message', data => {
 				try {
-					const msg = JSON.parse(data.toString()) as CdpResponse;
-					if (msg.id && pending.has(msg.id)) {
-						pending.get(msg.id)?.(msg);
-						pending.delete(msg.id);
+					const message = JSON.parse(data.toString());
+					if (message.id === 1) {
+						finish(message.error ? timeout : null, message.result);
 					}
-				} catch (_) {
-					// ignore malformed messages
+				} catch {
+					finish(timeout);
 				}
 			});
-
-			ws.on('error', () => finish([]));
-			ws.on('close', () => finish([]));
 		});
-	}
-
-	private navigatePage(target: CdpTarget, url: string): Promise<void> {
-		return new Promise((resolve) => {
-			let settled = false;
-			let ws: WebSocket | null = null;
-			let nextId = 1;
-			const pending = new Map<number, () => void>();
-
-			const finish = () => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				clearTimeout(timer);
-				try {
-					ws?.terminate();
-				} catch (_) {
-					// ignore
-				}
-				resolve();
-			};
-
-			const timer = setTimeout(() => finish(), 5000);
-
-			try {
-				ws = new WebSocket(target.webSocketDebuggerUrl as string, {
-					handshakeTimeout: 4000,
-					maxPayload: 2 * 1024 * 1024
-				});
-			} catch (_) {
-				finish();
-				return;
-			}
-
-			ws.on('open', () => {
-				if (!ws) {
-					finish();
-					return;
-				}
-
-				const enableId = nextId++;
-				ws.send(JSON.stringify({ id: enableId, method: 'Page.enable' }));
-
-				const navigateId = nextId++;
-				pending.set(navigateId, () => finish());
-				ws.send(JSON.stringify({ id: navigateId, method: 'Page.navigate', params: { url } }));
-			});
-
-			ws.on('message', (data: Buffer) => {
-				try {
-					const msg = JSON.parse(data.toString()) as CdpResponse;
-					if (msg.id && pending.has(msg.id)) {
-						pending.get(msg.id)?.();
-						pending.delete(msg.id);
-					}
-				} catch (_) {
-					// ignore malformed messages
-				}
-			});
-
-			ws.on('error', () => finish());
-			ws.on('close', () => finish());
-		});
-	}
-
-	private buildCookieHeader(cookies: CdpCookie[]): string {
-		if (!cookies.length) {
-			return '';
-		}
-		return cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
 	}
 
 	/**
