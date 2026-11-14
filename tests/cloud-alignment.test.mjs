@@ -13,14 +13,19 @@ const output = buildSync({
     export {default as FileManager} from './src/fileManager';
     export {default as MinoteApi} from './src/minoteApi';
     export {settingsStore} from './src/settings';
+    export {ImportCancelledError, WebSessionError} from './src/importControl';
     export {withNoteProperties} from './src/noteProperties';`, resolveDir: root },
   bundle: true, write: false, platform: 'node', format: 'cjs', conditions: ['production'], external: ['obsidian']
 }).outputFiles[0].text;
 const module = { exports: {} };
 const normalizePath = value => path.posix.normalize(value.replaceAll('\\', '/')).replace(/\/$/, '');
 vm.runInThisContext(`(function(require,module,exports){${output}\n})`)(
-  name => name === 'obsidian' ? { normalizePath } : require(name), module, module.exports);
-const { NoteSyncer, FileManager, MinoteApi, settingsStore, withNoteProperties } = module.exports;
+  name => name === 'obsidian' ? { normalizePath } : name === 'fs/promises' ? {
+    realpath: async target => path.resolve(target),
+    rmdir: async target => memoryVault.adapter.removeEmptyFolder(
+      path.relative(root, target).split(path.sep).join('/'))
+  } : require(name), module, module.exports);
+const { NoteSyncer, FileManager, MinoteApi, settingsStore, withNoteProperties, ImportCancelledError, WebSessionError } = module.exports;
 
 const time = 1_700_000_000_000;
 const cloudNote = (id = '101', title = '笔记', folderId = '10', extra = {}) => ({
@@ -34,6 +39,7 @@ const page = (entries = [], folders = [], lastPage = true, syncTag = '') => ({
 const markdown = (entry = cloudNote(), body = '原有正文', category = '分类') =>
   withNoteProperties('', { ...entry, title: JSON.parse(entry.extraInfo).title }, category, body);
 
+let memoryVault;
 class MemoryVault {
   files = new Map();
   folders = new Set(['']);
@@ -64,8 +70,9 @@ class MemoryVault {
         vault.trashed.push(file);
         vault.files.delete(file);
       },
-      rmdir: async (folder, recursive) => {
-        assert.equal(recursive, false);
+      getBasePath: () => root,
+      getFullPath: folder => path.join(root, folder),
+      removeEmptyFolder: async folder => {
         assert.equal([...vault.files.keys(), ...vault.folders].some(file => file.startsWith(folder + '/')), false);
         vault.folders.delete(folder);
       },
@@ -83,16 +90,18 @@ class MemoryVault {
     this.files.set(file, body);
   }
   async createFolder(folder) { this.folders.add(folder); }
+  configDir = '.obsidian';
   getMarkdownFiles() { return [...this.files.keys()].filter(file => file.endsWith('.md')).map(path => ({ path })); }
 }
 
 async function setup({ entries = [], folders = [], pages, history = [], files = {}, destination = '导入', cookie = 'userId=42' } = {}) {
-  const vault = new MemoryVault();
+  const vault = memoryVault = new MemoryVault();
   for (const [file, body] of Object.entries(files)) vault.put(file, body);
   let saved;
   await settingsStore.initialize({ loadData: async () => ({
     cookie, host: 'i.mi.com', webLoginConfirmed: true, lastImportDestination: destination, lastTimeSynced: history
   }), saveData: async data => { saved = structuredClone(data); } });
+  settingsStore.actions.setLogin(cookie, '测试账号');
   const api = new MinoteApi();
   const inventory = pages ?? [page(entries, folders)];
   const pageCalls = [];
@@ -127,10 +136,10 @@ async function setup({ entries = [], folders = [], pages, history = [], files = 
   const setHistory = async records => {
     await settingsStore.actions.setImportResult(destination, '', records);
   };
-  const sync = async (force = false) => {
+  const sync = async (force = false, control = {}, onProgress = () => {}) => {
     const syncer = new NoteSyncer(manager, api, external,
       record => settingsStore.actions.checkpointMove(destination, record));
-    const result = await syncer.sync(force, () => {});
+    const result = await syncer.sync(force, onProgress, control);
     await settingsStore.actions.setImportResult(destination, '', result.synced);
     return result;
   };
@@ -341,13 +350,15 @@ test('旧编号迁移后仍能移动和更新，不误判为其他笔记占用',
 test('加密正文暂时无法解密时保留文件和附件', async () => {
   const entry = cloudNote('101', '笔记', '10', { modifyDate: time + 200, encryptInfo: {} });
   const env = await setup({ entries: [entry], folders: [cloudFolder()], files: {
-    '导入/分类/笔记.md': markdown(), '导入/分类/img/photo.png': '图片'
+    '导入/分类/笔记.md': markdown(), '导入/分类/img/photo.png': '图片',
+    '导入/分类/云端已删除.md': markdown(cloudNote('102'))
   } });
-  await env.setHistory([env.record(), env.image('分类/img/photo.png')]);
+  await env.setHistory([env.record(), env.image('分类/img/photo.png'), env.record(cloudNote('102'), '分类/云端已删除.md')]);
   const result = await env.sync();
   assert.equal(result.locked, 1);
   assert.equal(result.deleted, 0);
   assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.files.has('导入/分类/云端已删除.md'), true);
 });
 
 test('保存位置不同不复用原目录的导入记录', async () => {
@@ -427,4 +438,124 @@ test('笔记库索引尚未发现外部引用文件时仍然保留其图片', as
   await env.setHistory([env.record(), env.image('分类/img/photo.png')]);
   await env.sync();
   assert.equal(env.vault.files.has('导入/分类/img/photo.png'), true);
+});
+
+test('Markdown 笔记按图片摘要替换小米图片地址并保留图片', async () => {
+  const digest = 'a'.repeat(40);
+  const entry = cloudNote('101', '笔记', '10', { type: 'mdNote',
+    content: `正文\n![图片](https://com.miui.notes/image/${digest}?size=full)`,
+    setting: { data: [{ mimeType: 'image/jpeg', fileId: 'photo', digest }] } });
+  const env = await setup({ entries: [entry], folders: [cloudFolder()] });
+  const result = await env.sync();
+  assert.equal(result.failed, 0);
+  assert.equal(result.partial, 0);
+  assert.match(env.vault.files.get('导入/分类/笔记.md'), /!\[图片\]\(img\/photo.jpeg\)/);
+  assert.equal(env.vault.files.has('导入/分类/img/photo.jpeg'), true);
+});
+
+test('图片下载失败时将 Markdown 小米图片引用记为待补并保留旧图片', async () => {
+  const digest = 'b'.repeat(40);
+  const entry = cloudNote('101', '笔记', '10', { content: `![](https://com.miui.notes/image/${digest})`,
+    setting: { data: [{ mimeType: 'image/jpeg', fileId: 'photo', digest }] } });
+  const env = await setup({ entries: [entry], folders: [cloudFolder()], files: { '导入/分类/img/old.jpeg': '旧图' } });
+  await env.setHistory([env.image('分类/img/old.jpeg')]);
+  env.api.fetchImage = async () => { throw Error('下载失败'); };
+  const result = await env.sync();
+  assert.equal(result.partial, 1);
+  assert.equal(env.vault.files.has('导入/分类/img/old.jpeg'), true);
+  assert.equal(result.synced.find(item => item.type === 'note').attachmentsPending, true);
+});
+
+test('升级后重新检查旧版标为完成但仍引用云端图片的笔记', async () => {
+  const digest = 'c'.repeat(40);
+  const body = `![](https://com.miui.notes/image/${digest}?size=full)`;
+  const entry = cloudNote('101', '笔记', '10', { content: body,
+    setting: { data: [{ mimeType: 'image/jpeg', fileId: 'photo', digest }] } });
+  const env = await setup({ entries: [entry], folders: [cloudFolder()], files: { '导入/分类/笔记.md': markdown(entry, body) } });
+  await env.setHistory([env.record()]);
+  const result = await env.sync();
+  assert.equal(env.detailCalls.length, 1);
+  assert.match(env.vault.files.get('导入/分类/笔记.md'), /!\[\]\(img\/photo.jpeg\)/);
+  assert.equal(result.synced.find(item => item.type === 'note').imageFormatVersion, 2);
+});
+
+test('取消未开始的导入时不读取清单、不写入、不清理并保留历史', async () => {
+  const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
+  await env.setHistory([env.record()]);
+  const controller = new AbortController(); controller.abort();
+  const result = await env.sync(false, { signal: controller.signal });
+  assert.equal(result.cancelled, true);
+  assert.equal(env.pageCalls.length, 0);
+  assert.equal(env.vault.writes.length, 0);
+  assert.equal(env.vault.trashed.length, 0);
+  assert.ok(result.synced.some(item => item.id === '101'));
+});
+
+test('正文读取期间取消时保留已完成记录和未处理文件，不执行删除清理', async () => {
+  const entries = [cloudNote(), cloudNote('102', '第二篇')];
+  const env = await setup({ entries, folders: [cloudFolder()], files: {
+    '导入/分类/第二篇.md': markdown(entries[1]), '导入/分类/旧笔记.md': markdown(cloudNote('103', '旧笔记'))
+  } });
+  await env.setHistory([env.record(entries[1], '分类/第二篇.md', { syncTime: 0 }),
+    env.record(cloudNote('103', '旧笔记'), '分类/旧笔记.md')]);
+  const controller = new AbortController();
+  const fetch = env.api.fetchNoteDetails;
+  env.api.fetchNoteDetails = async id => { const value = await fetch(id); if (id === '102') controller.abort(); return value; };
+  const result = await env.sync(false, { signal: controller.signal });
+  assert.equal(result.cancelled, true);
+  assert.equal(result.count, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(env.vault.trashed.length, 0);
+  assert.ok(result.synced.some(item => item.id === '101'));
+  assert.ok(result.synced.some(item => item.id === '102'));
+  assert.ok(env.vault.files.has('导入/分类/旧笔记.md'));
+});
+
+test('处理完最后一篇时取消也不会进入云端删除清理', async () => {
+  const env = await setup({ entries: [cloudNote()], folders: [cloudFolder()],
+    files: { '导入/分类/旧笔记.md': markdown(cloudNote('102', '旧笔记')) } });
+  await env.setHistory([env.record(cloudNote('102', '旧笔记'), '分类/旧笔记.md')]);
+  const controller = new AbortController();
+  const result = await env.sync(false, { signal: controller.signal }, counts => { if (counts.count) controller.abort(); });
+  assert.equal(result.count, 1);
+  assert.equal(result.cancelled, true);
+  assert.equal(result.deleted, 0);
+  assert.equal(env.vault.trashed.length, 0);
+});
+
+test('读取后会话变化立即停止，不把连接失效吞成逐篇失败', async () => {
+  const env = await setup({ entries: [cloudNote()], folders: [cloudFolder()] });
+  let current = true;
+  const fetch = env.api.fetchNoteDetails;
+  env.api.fetchNoteDetails = async id => { const value = await fetch(id); current = false; return value; };
+  const result = await env.sync(false, { assertActive: async () => { if (!current) throw new WebSessionError(); } });
+  assert.ok(result.interrupted);
+  assert.equal(result.cancelled, false);
+  assert.equal(result.failed, 0);
+  assert.equal(env.vault.writes.length, 0);
+});
+
+test('文件写入与回收站操作均受取消保护', async () => {
+  const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
+  const manager = new FileManager(env.vault, env.vault.adapter, '导入', async () => { throw new ImportCancelledError(); });
+  await assert.rejects(manager.saveFile('分类/笔记.md', '新正文', time, time), ImportCancelledError);
+  await assert.rejects(manager.deleteFile('分类/笔记.md'), ImportCancelledError);
+  assert.equal(env.vault.writes.length, 0);
+  assert.equal(env.vault.trashed.length, 0);
+});
+
+test('清单请求未返回时取消也能结束，并忽略晚到的清单', async () => {
+  const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
+  await env.setHistory([env.record()]);
+  let complete;
+  env.api.fetchPage = () => new Promise(resolve => { complete = resolve; });
+  const controller = new AbortController();
+  const pending = env.sync(false, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  const result = await pending;
+  assert.equal(result.cancelled, true);
+  assert.equal(env.vault.trashed.length, 0);
+  complete(page());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(env.vault.trashed.length, 0);
 });
