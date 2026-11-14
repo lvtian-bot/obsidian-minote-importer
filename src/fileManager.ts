@@ -83,6 +83,29 @@ export default class FileManager {
 		await this.adapter.copy(this.vaultPath(oldPath), this.vaultPath(newPath));
 	}
 
+	async updateFile(filePath: string, update: (content: string) => string): Promise<boolean> {
+		const fullPath = this.vaultPath(filePath);
+		const original = await this.adapter.read(fullPath);
+		const replacement = update(original);
+		if (replacement === original) return false;
+		const stat = await this.adapter.stat(fullPath);
+		if (!stat || stat.type !== 'file') throw new Error('Missing note file');
+		const times = { ctime: stat.ctime, mtime: stat.mtime };
+		if (typeof this.adapter.process !== 'function') {
+			// Older supported Obsidian versions have no atomic adapter process method.
+			if (await this.adapter.read(fullPath) !== original) throw new Error('Note changed during property update');
+			await this.adapter.write(fullPath, replacement, times);
+			return true;
+		}
+		let updated = false;
+		await this.adapter.process(fullPath, content => {
+			const result = content === original ? replacement : update(content);
+			updated = result !== content;
+			return result;
+		}, times);
+		return updated;
+	}
+
 	async saveFile(filePath: string, content: string, createDate: number, modifyDate: number) {
 		if (!filePath) {
 			return;

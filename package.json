@@ -30,7 +30,8 @@
 	"dependencies": {
 		"@types/lodash.pickby": "^4.6.7",
 		"lodash.pickby": "^4.6.0",
-		"ws": "^8.18.0"
+		"ws": "^8.18.0",
+		"yaml": "^2.9.1"
 	},
 	"repository": {
 		"type": "git",

@@ -10,6 +10,7 @@ import FileManager from './fileManager';
 import MinoteApi from './minoteApi';
 import type ExternalLoginService from './externalLogin';
 import { isEncryptedNoteContent } from './webNote';
+import { withNoteProperties } from './noteProperties';
 import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
 
@@ -32,7 +33,7 @@ export default class NoteSyncer {
 	private minoteApi: MinoteApi;
 	private notes: Note[] = [];
 	private folders: Folder[] = [];
-	private folderDict: Record<string, string> = {};
+	private folderDict: Record<string, Folder> = {};
 	private thisTimeSynced: SyncInfo[] = [];
 	private lastSyncedNotes: Record<string, SyncInfo> = {};
 
@@ -112,11 +113,6 @@ export default class NoteSyncer {
 						title = typeof entry.subject === 'string' && entry.subject && !isEncryptedNoteContent(entry.subject)
 							? entry.subject : `${firstLine || '未命名笔记'}_${id}`;
 					}
-					// 去除标题中的HTML标签
-					title = title.replace(/<[^>]+>/g, '');
-					// 去除标题中的非法字符 \/:*?"<>| 和换行符
-					title = this.safeName(title);
-
 					const note: Note = {
 						id,
 						// The legacy ID can be a JSON integer beyond JavaScript's safe range.
@@ -140,6 +136,7 @@ export default class NoteSyncer {
 					const folder: Folder = {
 						id,
 						name: this.safeName(entry.subject) || '未命名分类',
+						category: entry.subject || '未命名分类',
 					};
 					this.folders.push(folder);
 				}
@@ -182,7 +179,7 @@ export default class NoteSyncer {
 
 	private async createFolders() {
 		// 添加默认文件夹
-		this.folders.unshift({ id: '0', name: '未分类' });
+		this.folders.unshift({ id: '0', name: '未分类', category: '未分类' });
 
 		const usedNames = new Set<string>();
 		// Reserve the default category before allocating names for cloud folders.
@@ -193,7 +190,7 @@ export default class NoteSyncer {
 			}
 			usedNames.add(this.pathKey(folder.name));
 			// 更新文件夹字典
-			this.folderDict[folder.id] = folder.name;
+			this.folderDict[folder.id] = folder;
 
 			// 创建文件夹目录
 			await this.fileManager.createFolder(folder.name);
@@ -226,20 +223,23 @@ export default class NoteSyncer {
 					}
 					delete previous.pendingMove;
 				}
-				const folderPath = this.folderDict[note.folderId];
-				if (!folderPath) throw new Error('Missing cloud folder');
+				const folder = this.folderDict[note.folderId];
+				if (!folder) throw new Error('Missing cloud folder');
+				const folderPath = folder.name;
 				const unchanged = !force && previous && note.modifyDate <= previous.syncTime;
 				if (unchanged && await this.checkPreviousNote(note, previous)) {
 					const sourceFolder = path.posix.dirname(previous.relativePath.replace(/\\/g, '/'));
-					let relativePath = previous.relativePath;
-					if (this.pathKey(sourceFolder) !== this.pathKey(folderPath)) {
+					const moved = this.pathKey(sourceFolder) !== this.pathKey(folderPath);
+					if (moved) {
 						step = '更新本地分类';
-						relativePath = await this.movePreviousNote(note, previous, folderPath);
-						result.count++;
-					} else {
-						result.skipped++;
+						previous.relativePath = await this.movePreviousNote(note, previous, folderPath);
 					}
-					this.thisTimeSynced.push({ ...previous, relativePath, decoded: previous.decoded ?? false, imageFormatChecked: true });
+					step = '写入本地文件';
+					const updated = await this.fileManager.updateFile(previous.relativePath,
+						markdown => withNoteProperties(markdown, note, folder.category));
+					if (moved || updated) result.count++;
+					else result.skipped++;
+					this.thisTimeSynced.push({ ...previous, name: note.title, decoded: previous.decoded ?? false, imageFormatChecked: true });
 					continue;
 				}
 
@@ -318,6 +318,10 @@ export default class NoteSyncer {
 
 				// 保存转换后的内容
 				step = '写入本地文件';
+				const previousMarkdown = previous && !this.pathOwnedByAnother(note.id, previous.relativePath)
+					&& await this.fileManager.exists(previous.relativePath)
+					? await this.fileManager.readFile(previous.relativePath) : '';
+				content = withNoteProperties(previousMarkdown, note, folder.category, content);
 				const notePath = await this.resolveNotePath(folderPath, note, encrypted, previous);
 				const replacing = previous && this.pathKey(previous.relativePath) !== this.pathKey(notePath)
 					&& !this.pathOwnedByAnother(note.id, previous.relativePath) && await this.fileManager.exists(previous.relativePath);
@@ -412,7 +416,8 @@ export default class NoteSyncer {
 			&& !this.pathOwnedByAnother(note.id, oldPath)) {
 			return previous.relativePath;
 		}
-		return this.availableNotePath(folder, note.id, note.title || '未命名笔记', oldPath);
+		const fileName = this.safeName(note.title.replace(/<[^>]+>/g, '')) || '未命名笔记';
+		return this.availableNotePath(folder, note.id, fileName, oldPath);
 	}
 
 	private async availableNotePath(folder: string, noteId: string, name: string, oldPath?: string): Promise<string> {
