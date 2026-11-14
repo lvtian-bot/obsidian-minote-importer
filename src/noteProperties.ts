@@ -4,7 +4,7 @@ import type { Note } from './models';
 const frontmatter = /^(?:\uFEFF)?---[ \t]*\r?\n((?:[^\r\n]*\r?\n)*?)---[ \t]*(?:\r?\n|$)/;
 const chinaOffset = 8 * 60 * 60 * 1000;
 
-function formatTime(value: number): string | undefined {
+export function formatTime(value: number): string | undefined {
 	if (!Number.isFinite(value)) return undefined;
 	const time = new Date(value + chinaOffset);
 	if (!Number.isFinite(time.getTime())) return undefined;

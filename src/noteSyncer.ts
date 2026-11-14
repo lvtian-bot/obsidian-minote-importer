@@ -3,6 +3,7 @@
  * @author Emac
  * @date 2025-01-05
  */
+import { createHash } from 'crypto';
 import { get } from 'svelte/store';
 
 import { settingsStore } from './settings';
@@ -10,7 +11,7 @@ import FileManager from './fileManager';
 import MinoteApi from './minoteApi';
 import type ExternalLoginService from './externalLogin';
 import { isEncryptedNoteContent } from './webNote';
-import { withNoteProperties } from './noteProperties';
+import { formatTime, withNoteProperties } from './noteProperties';
 import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
 
@@ -106,18 +107,15 @@ export default class NoteSyncer {
 					if (this.isPrivate(folderId, extra.isPrivate) || entry.status === 'deleted' || entry.status === 'purged'
 						|| !/^\d+$/.test(id) || seenNotes.has(id)) continue;
 					seenNotes.add(id);
-					let title = typeof extra.title === 'string' ? extra.title : '';
 					const encrypted = Boolean(entry.encryptInfo) || (typeof entry.snippet === 'string' && isEncryptedNoteContent(entry.snippet));
-					if (!title) {
-						const firstLine = !encrypted && typeof entry.snippet === 'string' ? entry.snippet.split('\n')[0] : '';
-						title = typeof entry.subject === 'string' && entry.subject && !isEncryptedNoteContent(entry.subject)
-							? entry.subject : `${firstLine || '未命名笔记'}_${id}`;
-					}
+					const originalTitle = typeof extra.title === 'string' && !isEncryptedNoteContent(extra.title)
+						? extra.title : '';
+
 					const note: Note = {
 						id,
 						// The legacy ID can be a JSON integer beyond JavaScript's safe range.
 						legacyId: this.readLegacyId(entry.extraInfo),
-						title,
+						title: this.noteFileName(originalTitle) ? originalTitle : this.untitledNoteName(entry.createDate, id),
 						createDate: entry.createDate,
 						modifyDate: entry.modifyDate,
 						folderId,
@@ -325,7 +323,8 @@ export default class NoteSyncer {
 					&& await this.fileManager.exists(previous.relativePath)
 					? await this.fileManager.readFile(previous.relativePath) : '';
 				content = withNoteProperties(previousMarkdown, note, folder.category, content);
-				const notePath = await this.resolveNotePath(folderPath, note, encrypted, moved ? undefined : previous);
+				const notePath = await this.availableNotePath(folderPath, note.id, this.noteFileName(note.title),
+					moved ? undefined : oldPath);
 				const replacing = previous && (moved || previous.relativePath.replace(/\\/g, '/') !== notePath)
 					&& !this.pathOwnedByAnother(note.id, previous.relativePath) && await this.fileManager.exists(previous.relativePath);
 				if (replacing && attachmentsPending) {
@@ -413,14 +412,16 @@ export default class NoteSyncer {
 			.some(item => item.type === 'note' && item.id !== noteId && this.pathKey(item.relativePath) === key);
 	}
 
-	private async resolveNotePath(folder: string, note: Note, encrypted: boolean, previous?: SyncInfo): Promise<string> {
-		const oldPath = previous?.relativePath.replace(/\\/g, '/');
-		if (encrypted && previous && oldPath && this.pathKey(path.posix.dirname(oldPath)) === this.pathKey(folder)
-			&& !this.pathOwnedByAnother(note.id, oldPath)) {
-			return previous.relativePath;
-		}
-		const fileName = this.safeName(note.title.replace(/<[^>]+>/g, '')) || '未命名笔记';
-		return this.availableNotePath(folder, note.id, fileName, oldPath);
+	private noteFileName(title: string): string {
+		return this.safeName(title.replace(/<[^>]+>/g, ''));
+	}
+
+	private untitledNoteName(createDate: number, noteId: string): string {
+		const day = formatTime(createDate)?.split('T')[0] ?? '无创建日期';
+		// 同一篇笔记每次导入得到相同的六位数字，避免反复改名。
+		const hash = createHash('sha256').update(noteId).digest().readUInt32BE(0);
+		const suffix = String(hash % 1_000_000).padStart(6, '0');
+		return `${day}-${suffix}`;
 	}
 
 	private async availableNotePath(folder: string, noteId: string, name: string, oldPath?: string): Promise<string> {
