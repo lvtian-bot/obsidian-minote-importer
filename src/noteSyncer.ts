@@ -240,12 +240,7 @@ export default class NoteSyncer {
 			let step = '检查本地文件';
 			try {
 				if (previous && this.account) previous.account = this.account;
-				if (previous?.pendingMove) {
-					if (!await this.fileManager.exists(previous.relativePath) && await this.fileManager.exists(previous.pendingMove)) {
-						previous.relativePath = previous.pendingMove;
-					}
-					delete previous.pendingMove;
-				}
+				if (previous) await this.recoverPendingMove(previous);
 				const folder = this.folderDict[note.folderId];
 				if (!folder) throw new Error('Missing cloud folder');
 				const folderPath = folder.name;
@@ -450,6 +445,26 @@ export default class NoteSyncer {
 		});
 	}
 
+	private async recoverPendingMove(previous: SyncInfo) {
+		if (!previous.pendingMove) return;
+		const sourceExists = await this.fileManager.exists(previous.relativePath);
+		const targetExists = await this.fileManager.exists(previous.pendingMove);
+		if (sourceExists && targetExists && this.pathKey(previous.relativePath) !== this.pathKey(previous.pendingMove)) {
+			throw new Error('Ambiguous interrupted move');
+		}
+		if (!sourceExists && targetExists) {
+			const markdown = await this.fileManager.readFile(previous.pendingMove);
+			for (const match of markdown.matchAll(localImage)) {
+				const source = path.posix.join(path.posix.dirname(previous.relativePath.replace(/\\/g, '/')), 'img', match[1]);
+				if (this.images.has(this.pathKey(source))) {
+					this.trackImage(path.posix.join(path.posix.dirname(previous.pendingMove.replace(/\\/g, '/')), 'img', match[1]));
+				}
+			}
+			previous.relativePath = previous.pendingMove;
+		}
+		delete previous.pendingMove;
+	}
+
 	private async cleanRemovedContent(result: ImportCounts) {
 		const cloudIds = new Set(this.notes.map(note => note.id));
 		const stale = Object.values(this.lastSyncedNotes).filter(item => !cloudIds.has(item.id));
@@ -464,12 +479,8 @@ export default class NoteSyncer {
 		}
 		for (const previous of stale) {
 			try {
-				let file = previous.relativePath;
-				if (previous.pendingMove && previous.pendingMove !== file
-					&& await this.fileManager.exists(file) && await this.fileManager.exists(previous.pendingMove)) {
-					throw new Error('Ambiguous interrupted move');
-				}
-				if (previous.pendingMove && !await this.fileManager.exists(file)) file = previous.pendingMove;
+				await this.recoverPendingMove(previous);
+				const file = previous.relativePath;
 				if (await this.fileManager.exists(file)) {
 					if (previous.account !== this.account || this.pathOwnedByAnother(previous.id, file)
 						|| readNoteId(await this.fileManager.readFile(file)) !== previous.id) throw new Error('Note identity mismatch');
@@ -482,9 +493,7 @@ export default class NoteSyncer {
 		// 待解密或写入失败时保留附件，避免根据不完整的正文判断图片已经无引用。
 		if (!result.locked && !result.partial && !result.failed) {
 			try {
-				const notes = [...this.thisTimeSynced, ...Object.values(this.lastSyncedNotes)]
-					.filter(item => item.type === 'note').map(item => item.relativePath);
-				const unused = await this.fileManager.unreferencedImages([...this.images.values()].map(item => item.relativePath), notes);
+				const unused = await this.fileManager.unreferencedImages([...this.images.values()].map(item => item.relativePath));
 				for (const image of unused) {
 					await this.fileManager.deleteFile(image);
 					this.images.delete(this.pathKey(image));

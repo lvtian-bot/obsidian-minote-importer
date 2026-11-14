@@ -405,3 +405,26 @@ test('图片未下载完整时保留旧笔记和旧图片，下次继续重试',
   assert.equal(env.vault.files.has('导入/分类/img/old-photo.png'), true);
   assert.equal(env.vault.trashed.length, 0);
 });
+
+test('移动完成后进程中断，重试删除时恢复目标图片归属', async () => {
+  const env = await setup({ files: {
+    '导入/新分类/笔记.md': markdown(cloudNote(), '![](img/photo.png)'),
+    '导入/分类/img/photo.png': '图片', '导入/新分类/img/photo.png': '图片'
+  } });
+  await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { pendingMove: '新分类/笔记.md' }),
+    env.image('分类/img/photo.png')]);
+  const result = await env.sync();
+  assert.equal(result.deleted, 1);
+  assert.equal(env.vault.files.has('导入/新分类/img/photo.png'), false);
+});
+
+test('笔记库索引尚未发现外部引用文件时仍然保留其图片', async () => {
+  const env = await setup({ files: {
+    '导入/分类/笔记.md': markdown(), '导入/分类/img/photo.png': '图片',
+    '其他/刚写入.md': '![[导入/分类/img/photo.png]]'
+  } });
+  env.vault.getMarkdownFiles = () => [];
+  await env.setHistory([env.record(), env.image('分类/img/photo.png')]);
+  await env.sync();
+  assert.equal(env.vault.files.has('导入/分类/img/photo.png'), true);
+});

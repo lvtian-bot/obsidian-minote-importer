@@ -82,11 +82,16 @@ export default class FileManager {
 		}
 	}
 
-	async unreferencedImages(candidates: string[], notePaths: string[]): Promise<string[]> {
+	async unreferencedImages(candidates: string[]): Promise<string[]> {
 		if (!candidates.length) return [];
 		const unused = new Set(candidates);
-		const files = new Set(this.vault.getMarkdownFiles().map(file => file.path));
-		for (const note of notePaths) files.add(this.vaultPath(note));
+		const files = new Set<string>();
+		const directories = [''];
+		while (directories.length) {
+			const children = await this.adapter.list(directories.pop()!);
+			for (const file of children.files) if (/\.md$/i.test(file)) files.add(file);
+			for (const folder of children.folders) if (folder !== '.trash') directories.push(folder);
+		}
 		const knownImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
 		for (const file of files) {
 			if (!await this.adapter.exists(file)) continue;
