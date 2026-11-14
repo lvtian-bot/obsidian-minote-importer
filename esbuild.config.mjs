@@ -40,6 +40,7 @@ const context = await esbuild.context({
 		"utf-8-validate",
 		...builtins],
 	platform: "node",
+	conditions: [prod ? "production" : "development"],
 	format: "cjs",
 	target: "es2018",
 	logLevel: "info",

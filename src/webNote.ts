@@ -66,7 +66,7 @@ export async function readWebNote(host: string, note: EncryptedNote | null, imag
 		const response = await fetch(url);
 		if (!response.ok) return null;
 		const blob = await response.blob();
-		if (!blob.size) return null;
+		if (!blob.size || blob.size > 48 * 1024 * 1024) return null;
 		return new Promise<string | null>(resolve => {
 			const reader = new FileReader();
 			reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result.split(',', 2)[1] ?? null : null);

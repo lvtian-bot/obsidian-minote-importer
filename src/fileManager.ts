@@ -6,11 +6,13 @@
 import { normalizePath } from 'obsidian';
 import type { FileSystemAdapter, Vault } from 'obsidian';
 import path from 'path';
+import { realpath, rmdir } from 'fs/promises';
 
 export default class FileManager {
 	readonly destination: string;
 
-	constructor(private readonly vault: Vault, private readonly adapter: FileSystemAdapter, destination: string) {
+	constructor(private readonly vault: Vault, private readonly adapter: FileSystemAdapter, destination: string,
+		private readonly beforeMutation?: () => Promise<void>) {
 		this.destination = destination === '/' ? '/' : this.validateRelativePath(destination);
 	}
 
@@ -55,6 +57,7 @@ export default class FileManager {
 		if (parent !== '.') {
 			await this.ensureDirectory(parent);
 		}
+		await this.beforeMutation?.();
 		await this.vault.createFolder(fullPath);
 	}
 
@@ -62,6 +65,7 @@ export default class FileManager {
 		if (await this.adapter.exists(directory)) return;
 		const parent = path.posix.dirname(directory);
 		if (parent !== '.') await this.ensureDirectory(parent);
+		await this.beforeMutation?.();
 		await this.vault.createFolder(directory);
 	}
 
@@ -70,16 +74,24 @@ export default class FileManager {
 			return;
 		}
 
+		await this.beforeMutation?.();
 		await this.adapter.trashLocal(this.vaultPath(filePath));
 	}
 
 	async deleteEmptyFolder(folderPath: string): Promise<void> {
 		if (!await this.exists(folderPath)) return;
-		const children = await this.adapter.list(this.vaultPath(folderPath));
-		if (!children.files.length && !children.folders.length) {
-			// 只删除已确认空的目录，禁止递归删除。
-			await this.adapter.rmdir(this.vaultPath(folderPath), false);
-		}
+		const relative = this.vaultPath(folderPath);
+		const children = await this.adapter.list(relative);
+		if (children.files.length || children.folders.length) return;
+		const root = await realpath(this.adapter.getBasePath());
+		const local = await realpath(this.adapter.getFullPath(relative));
+		const verified = path.relative(root, local);
+		if (!verified || path.isAbsolute(verified) || verified === '..' || verified.startsWith('..' + path.sep)
+			|| path.normalize(relative) !== verified) return;
+		// Obsidian 的部分版本用 fs.rm 实现 rmdir，非递归调用不能删除目录。
+		// 原生 rmdir 只接受空目录，即便检查后又写入文件也不会误删。
+		await this.beforeMutation?.();
+		await rmdir(local);
 	}
 
 	async unreferencedImages(candidates: string[]): Promise<string[]> {
@@ -88,12 +100,17 @@ export default class FileManager {
 		const files = new Set<string>();
 		const directories = [''];
 		while (directories.length) {
-			const children = await this.adapter.list(directories.pop()!);
+			const directory = directories.pop()!;
+			// 笔记库可能同时删除或移动目录；不把读不全的扫描结果用于清理。
+			const children = await this.adapter.list(directory);
 			for (const file of children.files) if (/\.md$/i.test(file)) files.add(file);
-			for (const folder of children.folders) if (folder !== '.trash') directories.push(folder);
+			for (const folder of children.folders) {
+				if (!['.trash', '.git', this.vault.configDir].includes(folder)) directories.push(folder);
+			}
 		}
 		const knownImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
 		for (const file of files) {
+			if (!unused.size) break;
 			if (!await this.adapter.exists(file)) continue;
 			const markdown = await this.adapter.read(file);
 			const referenced = new Set([...markdown.matchAll(knownImage)].map(match =>
@@ -112,11 +129,13 @@ export default class FileManager {
 
 	async moveFile(oldPath: string, newPath: string): Promise<void> {
 		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.beforeMutation?.();
 		await this.adapter.rename(this.vaultPath(oldPath), this.vaultPath(newPath));
 	}
 
 	async copyFile(oldPath: string, newPath: string): Promise<void> {
 		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.beforeMutation?.();
 		await this.adapter.copy(this.vaultPath(oldPath), this.vaultPath(newPath));
 	}
 
@@ -143,10 +162,12 @@ export default class FileManager {
 		if (typeof this.adapter.process !== 'function') {
 			// Older supported Obsidian versions have no atomic adapter process method.
 			if (await this.adapter.read(fullPath) !== original) throw new Error('Note changed during property update');
+			await this.beforeMutation?.();
 			await this.adapter.write(fullPath, replacement, times);
 			return true;
 		}
 		let updated = false;
+		await this.beforeMutation?.();
 		await this.adapter.process(fullPath, content => {
 			const result = content === original ? replacement : update(content);
 			updated = result !== content;
@@ -161,6 +182,7 @@ export default class FileManager {
 		}
 
 		const fullPath = this.vaultPath(filePath);
+		await this.beforeMutation?.();
 		await this.adapter.write(fullPath, content, {
 			ctime: Number.isFinite(createDate) ? createDate : undefined,
 			mtime: Number.isFinite(modifyDate) ? modifyDate : undefined,
@@ -172,6 +194,7 @@ export default class FileManager {
 			return;
 		}
 
+		await this.beforeMutation?.();
 		await this.adapter.writeBinary(this.vaultPath(filePath), binary);
 	}
 }
