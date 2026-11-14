@@ -11,7 +11,7 @@ import FileManager from './fileManager';
 import MinoteApi from './minoteApi';
 import type ExternalLoginService from './externalLogin';
 import { isEncryptedNoteContent } from './webNote';
-import { withNoteProperties } from './noteProperties';
+import { formatTime, withNoteProperties } from './noteProperties';
 import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
 
@@ -417,11 +417,7 @@ export default class NoteSyncer {
 	}
 
 	private untitledNoteName(createDate: number, noteId: string): string {
-		const date = new Date(createDate);
-		const day = Number.isFinite(createDate) && !Number.isNaN(date.getTime())
-			? [String(date.getFullYear()).padStart(4, '0'), String(date.getMonth() + 1).padStart(2, '0'),
-				String(date.getDate()).padStart(2, '0')].join('-')
-			: '无创建日期';
+		const day = formatTime(createDate)?.split('T')[0] ?? '无创建日期';
 		// 同一篇笔记每次导入得到相同的六位数字，避免反复改名。
 		const hash = createHash('sha256').update(noteId).digest().readUInt32BE(0);
 		const suffix = String(hash % 1_000_000).padStart(6, '0');
