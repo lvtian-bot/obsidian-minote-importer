@@ -83,6 +83,12 @@ export default class FileManager {
 		await this.adapter.copy(this.vaultPath(oldPath), this.vaultPath(newPath));
 	}
 
+	async hasSeparateFolders(oldFolder: string, newFolder: string): Promise<boolean> {
+		const parent = this.destination === '/' ? '' : this.destination;
+		const { folders } = await this.adapter.list(parent);
+		return folders.includes(this.vaultPath(oldFolder)) && folders.includes(this.vaultPath(newFolder));
+	}
+
 	async updateFile(filePath: string, update: (content: string) => string): Promise<boolean> {
 		const fullPath = this.vaultPath(filePath);
 		const original = await this.adapter.read(fullPath);

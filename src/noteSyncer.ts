@@ -15,7 +15,7 @@ import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo } from './models';
 
 const originalImage = /☺[^\S\r\n]+[^\s<]+|<img\b[^>]*\bfileid=/i;
-const localImage = /!\[\]\(img\/([a-z\d_~.-]+)\)/gi;
+const localImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
 const cloudNoteTypes = new Set(['note', 'mdNote', 'mindMap']);
 
 interface ImportCounts {
@@ -226,10 +226,13 @@ export default class NoteSyncer {
 				const folder = this.folderDict[note.folderId];
 				if (!folder) throw new Error('Missing cloud folder');
 				const folderPath = folder.name;
+				const oldPath = previous?.relativePath.replace(/\\/g, '/');
+				const sourceFolder = oldPath ? path.posix.dirname(oldPath) : undefined;
+				const moved = sourceFolder !== undefined && sourceFolder !== folderPath
+					&& (this.pathKey(sourceFolder) !== this.pathKey(folderPath)
+						|| await this.fileManager.hasSeparateFolders(sourceFolder, folderPath));
 				const unchanged = !force && previous && note.modifyDate <= previous.syncTime;
 				if (unchanged && await this.checkPreviousNote(note, previous)) {
-					const sourceFolder = path.posix.dirname(previous.relativePath.replace(/\\/g, '/'));
-					const moved = this.pathKey(sourceFolder) !== this.pathKey(folderPath);
 					if (moved) {
 						step = '更新本地分类';
 						previous.relativePath = await this.movePreviousNote(note, previous, folderPath);
@@ -322,8 +325,8 @@ export default class NoteSyncer {
 					&& await this.fileManager.exists(previous.relativePath)
 					? await this.fileManager.readFile(previous.relativePath) : '';
 				content = withNoteProperties(previousMarkdown, note, folder.category, content);
-				const notePath = await this.resolveNotePath(folderPath, note, encrypted, previous);
-				const replacing = previous && this.pathKey(previous.relativePath) !== this.pathKey(notePath)
+				const notePath = await this.resolveNotePath(folderPath, note, encrypted, moved ? undefined : previous);
+				const replacing = previous && (moved || this.pathKey(previous.relativePath) !== this.pathKey(notePath))
 					&& !this.pathOwnedByAnother(note.id, previous.relativePath) && await this.fileManager.exists(previous.relativePath);
 				if (replacing && attachmentsPending) {
 					step = '处理图片';
@@ -384,7 +387,7 @@ export default class NoteSyncer {
 
 	private async copyPreviousImages(oldPath: string, folder: string, requireImages = false) {
 		const oldFolder = path.posix.dirname(oldPath.replace(/\\/g, '/'));
-		if (this.pathKey(oldFolder) === this.pathKey(folder)) return;
+		if (oldFolder === folder) return;
 		const content = await this.fileManager.readFile(oldPath);
 		for (const fileName of new Set([...content.matchAll(localImage)].map(match => match[1]))) {
 			const target = path.posix.join(folder, 'img', fileName);
