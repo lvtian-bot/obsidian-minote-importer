@@ -326,7 +326,7 @@ export default class NoteSyncer {
 					? await this.fileManager.readFile(previous.relativePath) : '';
 				content = withNoteProperties(previousMarkdown, note, folder.category, content);
 				const notePath = await this.resolveNotePath(folderPath, note, encrypted, moved ? undefined : previous);
-				const replacing = previous && (moved || this.pathKey(previous.relativePath) !== this.pathKey(notePath))
+				const replacing = previous && (moved || previous.relativePath.replace(/\\/g, '/') !== notePath)
 					&& !this.pathOwnedByAnother(note.id, previous.relativePath) && await this.fileManager.exists(previous.relativePath);
 				if (replacing && attachmentsPending) {
 					step = '处理图片';
@@ -430,11 +430,14 @@ export default class NoteSyncer {
 			stem += char;
 		}
 		let candidate = path.posix.join(folder, `${stem}.md`);
-		const owns = (value: string) => oldPath && this.pathKey(oldPath) === this.pathKey(value);
-		for (let index = 1; this.pathOwnedByAnother(noteId, candidate) || (!owns(candidate) && await this.fileManager.exists(candidate)); index++) {
+		for (let index = 1; ; index++) {
+			if (!this.pathOwnedByAnother(noteId, candidate)) {
+				if (oldPath === candidate || !await this.fileManager.exists(candidate)) return candidate;
+				if (oldPath && this.pathKey(oldPath) === this.pathKey(candidate)
+					&& await this.fileManager.isExistingFileAlias(oldPath, candidate)) return oldPath;
+			}
 			candidate = path.posix.join(folder, `${stem}_${this.safeName(noteId)}_${index}.md`);
 		}
-		return candidate;
 	}
 
 	private safeName(value: string): string {

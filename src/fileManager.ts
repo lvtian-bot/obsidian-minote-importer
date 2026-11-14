@@ -89,6 +89,12 @@ export default class FileManager {
 		return folders.includes(this.vaultPath(oldFolder)) && folders.includes(this.vaultPath(newFolder));
 	}
 
+	async isExistingFileAlias(oldPath: string, newPath: string): Promise<boolean> {
+		if (!await this.exists(oldPath) || !await this.exists(newPath)) return false;
+		const { files } = await this.adapter.list(path.posix.dirname(this.vaultPath(oldPath)));
+		return !files.includes(this.vaultPath(newPath));
+	}
+
 	async updateFile(filePath: string, update: (content: string) => string): Promise<boolean> {
 		const fullPath = this.vaultPath(filePath);
 		const original = await this.adapter.read(fullPath);
