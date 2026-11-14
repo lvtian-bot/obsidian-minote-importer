@@ -4,22 +4,28 @@
  * @date 2025-01-05
  */
 import { normalizePath } from 'obsidian';
-import type { Vault, MetadataCache } from 'obsidian';
-import { get } from 'svelte/store';
+import type { FileSystemAdapter, Vault } from 'obsidian';
 import path from 'path';
-import fs from 'fs';
-
-import { settingsStore } from './settings';
 
 export default class FileManager {
-	private vault: Vault;
-	private metadataCache: MetadataCache;
+	readonly destination: string;
 
-	constructor(vault: Vault, metadataCache: MetadataCache) {
-		this.vault = vault;
-		this.metadataCache = metadataCache;
-		// 创建默认文件夹（如果不存在）
-		this.createFolder("", Date.now());
+	constructor(private readonly vault: Vault, private readonly adapter: FileSystemAdapter, destination: string) {
+		this.destination = destination === '/' ? '/' : this.validateRelativePath(destination);
+	}
+
+	private validateRelativePath(value: string): string {
+		const relative = value.replace(/\\/g, '/');
+		if (!relative || relative.startsWith('/') || /[:\0]/.test(relative)
+			|| relative.split('/').some(segment => segment === '..' || segment === '.')) {
+			throw new Error('Invalid path in note import');
+		}
+		return normalizePath(relative);
+	}
+
+	private vaultPath(relative: string): string {
+		const child = this.validateRelativePath(relative);
+		return this.destination === '/' ? child : this.destination + '/' + child;
 	}
 
 	async exists(filePath: string) {
@@ -27,30 +33,36 @@ export default class FileManager {
 			return false;
 		}
 
-		return this.vault.adapter.exists(normalizePath(path.join(get(settingsStore).noteLocation, filePath)));
+		return this.adapter.exists(this.vaultPath(filePath));
 	}
 
-	async createFolder(folderPath: string, createDate: number) {
+	async readFile(filePath: string): Promise<string> {
+		return this.adapter.read(this.vaultPath(filePath));
+	}
+
+	async hasBinaryFile(filePath: string): Promise<boolean> {
+		const stat = await this.adapter.stat(this.vaultPath(filePath));
+		return stat?.type === 'file' && stat.size > 0;
+	}
+
+	async createFolder(folderPath: string) {
 		if (!folderPath || await this.exists(folderPath)) {
 			return;
 		}
 
-		const fullPath = normalizePath(path.join(get(settingsStore).noteLocation, folderPath));
+		const fullPath = this.vaultPath(folderPath);
+		const parent = path.posix.dirname(fullPath);
+		if (parent !== '.') {
+			await this.ensureDirectory(parent);
+		}
 		await this.vault.createFolder(fullPath);
-		const absolutePath = (this.vault.adapter as any).getFullPath(fullPath);
-		fs.utimesSync(absolutePath, createDate / 1000, createDate / 1000);
 	}
 
-	async renameFolder(oldPath: string, newPath: string) {
-		if (!oldPath || !newPath) {
-			return;
-		}
-
-		if (await !this.exists(oldPath) || await this.exists(newPath)) {
-			return;
-		}
-
-		this.vault.adapter.rename(normalizePath(path.join(get(settingsStore).noteLocation, oldPath)), normalizePath(path.join(get(settingsStore).noteLocation, newPath)));
+	private async ensureDirectory(directory: string): Promise<void> {
+		if (await this.adapter.exists(directory)) return;
+		const parent = path.posix.dirname(directory);
+		if (parent !== '.') await this.ensureDirectory(parent);
+		await this.vault.createFolder(directory);
 	}
 
 	async deleteFile(filePath: string) {
@@ -58,7 +70,52 @@ export default class FileManager {
 			return;
 		}
 
-		this.vault.adapter.remove(normalizePath(path.join(get(settingsStore).noteLocation, filePath)));
+		await this.adapter.remove(this.vaultPath(filePath));
+	}
+
+	async moveFile(oldPath: string, newPath: string): Promise<void> {
+		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.adapter.rename(this.vaultPath(oldPath), this.vaultPath(newPath));
+	}
+
+	async copyFile(oldPath: string, newPath: string): Promise<void> {
+		if (await this.exists(newPath)) throw new Error('Destination already exists');
+		await this.adapter.copy(this.vaultPath(oldPath), this.vaultPath(newPath));
+	}
+
+	async hasSeparateFolders(oldFolder: string, newFolder: string): Promise<boolean> {
+		const parent = this.destination === '/' ? '' : this.destination;
+		const { folders } = await this.adapter.list(parent);
+		return folders.includes(this.vaultPath(oldFolder)) && folders.includes(this.vaultPath(newFolder));
+	}
+
+	async isExistingFileAlias(oldPath: string, newPath: string): Promise<boolean> {
+		if (!await this.exists(oldPath) || !await this.exists(newPath)) return false;
+		const { files } = await this.adapter.list(path.posix.dirname(this.vaultPath(oldPath)));
+		return !files.includes(this.vaultPath(newPath));
+	}
+
+	async updateFile(filePath: string, update: (content: string) => string): Promise<boolean> {
+		const fullPath = this.vaultPath(filePath);
+		const original = await this.adapter.read(fullPath);
+		const replacement = update(original);
+		if (replacement === original) return false;
+		const stat = await this.adapter.stat(fullPath);
+		if (!stat || stat.type !== 'file') throw new Error('Missing note file');
+		const times = { ctime: stat.ctime, mtime: stat.mtime };
+		if (typeof this.adapter.process !== 'function') {
+			// Older supported Obsidian versions have no atomic adapter process method.
+			if (await this.adapter.read(fullPath) !== original) throw new Error('Note changed during property update');
+			await this.adapter.write(fullPath, replacement, times);
+			return true;
+		}
+		let updated = false;
+		await this.adapter.process(fullPath, content => {
+			const result = content === original ? replacement : update(content);
+			updated = result !== content;
+			return result;
+		}, times);
+		return updated;
 	}
 
 	async saveFile(filePath: string, content: string, createDate: number, modifyDate: number) {
@@ -66,10 +123,11 @@ export default class FileManager {
 			return;
 		}
 
-		const fullPath = normalizePath(path.join(get(settingsStore).noteLocation, filePath));
-		await this.vault.adapter.write(fullPath, content);
-		const absolutePath = (this.vault.adapter as any).getFullPath(fullPath);
-		fs.utimesSync(absolutePath, createDate / 1000, modifyDate / 1000);
+		const fullPath = this.vaultPath(filePath);
+		await this.adapter.write(fullPath, content, {
+			ctime: Number.isFinite(createDate) ? createDate : undefined,
+			mtime: Number.isFinite(modifyDate) ? modifyDate : undefined,
+		});
 	}
 
 	async saveBinaryFile(filePath: string, binary: ArrayBuffer) {
@@ -77,6 +135,6 @@ export default class FileManager {
 			return;
 		}
 
-		this.vault.adapter.writeBinary(normalizePath(path.join(get(settingsStore).noteLocation, filePath)), binary);
+		await this.adapter.writeBinary(this.vaultPath(filePath), binary);
 	}
 }

@@ -6,7 +6,7 @@
 import { FileSystemAdapter, Menu, Notice, Plugin } from 'obsidian';
 import { get } from 'svelte/store';
 
-import { settingsStore } from './src/settings';
+import { importProgress, settingsStore } from './src/settings';
 import { MinoteSettingTab } from './src/settingTab';
 import FileManager from './src/fileManager';
 import MinoteApi from './src/minoteApi';
@@ -14,16 +14,12 @@ import NoteSyncer from './src/noteSyncer';
 import ExternalLoginService from './src/externalLogin';
 
 export default class MinotePlugin extends Plugin {
-	private noteSyncer: NoteSyncer;
 	private externalLogin: ExternalLoginService;
 	private syncing = false;
 
 	async onload() {
 		await settingsStore.initialize(this);
 
-		const fileManager = new FileManager(this.app.vault, this.app.metadataCache);
-		const minoteApi = new MinoteApi();
-		this.noteSyncer = new NoteSyncer(fileManager, minoteApi);
 		const adapter = this.app.vault.adapter;
 		if (!(adapter instanceof FileSystemAdapter)) {
 			throw new Error('Minote Importer requires a desktop vault');
@@ -93,20 +89,16 @@ export default class MinotePlugin extends Plugin {
 			name: '使用外部浏览器登录小米云服务',
 			callback: async () => {
 				const result = await this.externalLogin.startLogin();
-				if (!result.success) {
-					new Notice(`Minote Importer：${result.message}`);
-				}
+				new Notice(`Minote Importer：${result.message}`);
 			}
 		});
 
 		this.addCommand({
-			id: 'refresh-cookie',
-			name: '刷新小米云服务 Cookie（外部浏览器）',
+			id: 'confirm-login',
+			name: '确认已完成小米云网页验证',
 			callback: async () => {
-				const result = await this.externalLogin.startRefreshCookie();
-				if (!result.success) {
-					new Notice(`Minote Importer：${result.message}`);
-				}
+				const result = await this.externalLogin.confirmLogin();
+				new Notice(result.message);
 			}
 		});
 
@@ -126,19 +118,45 @@ export default class MinotePlugin extends Plugin {
 			new Notice('正在导入小米笔记，请勿重复点击');
 			return;
 		}
-		if (!get(settingsStore).cookie) {
-			new Notice('尚未登录小米云服务，请先执行「使用外部浏览器登录小米云服务」');
+		const { cookie, noteLocation } = get(settingsStore);
+		if (!cookie) {
+			new Notice('请打开小米云网页完成验证，等 Obsidian 显示已登录后再导入。');
 			return;
 		}
+		const vault = this.app.vault;
+		if (!(vault.adapter instanceof FileSystemAdapter)) return;
 		this.syncing = true;
+		const initial = `正在读取小米云笔记清单… 保存位置：${noteLocation}`;
+		const progress = new Notice(initial, 0);
+		importProgress.set(initial);
 		try {
-			new Notice('开始导入小米笔记...');
-			const syncedCount = await this.noteSyncer.sync(force);
-			new Notice(`已导入 ${syncedCount} 篇小米笔记`);
-		} catch (e) {
-			new Notice('导入小米笔记失败，请检查网络和登录状态');
-			console.error('[minote-importer] failed to import notes');
+			const fileManager = new FileManager(vault, vault.adapter, noteLocation);
+			const noteSyncer = new NoteSyncer(fileManager, new MinoteApi(), this.externalLogin,
+				record => settingsStore.actions.checkpointMove(fileManager.destination, record));
+			let nextUpdate = 0;
+			const { total, count, skipped, locked, failed, partial, failuresByStep, synced } = await noteSyncer.sync(force, result => {
+				const processed = result.count + result.skipped + result.locked + result.failed;
+				if (Date.now() < nextUpdate && processed < result.total) return;
+				nextUpdate = Date.now() + 500;
+				const message = `正在导入小米笔记，已处理 ${processed}/${result.total} 篇。保存位置：${fileManager.destination}`;
+				importProgress.set(message);
+				progress.setMessage(message);
+			});
+			const status = locked || failed || partial ? '导入结束，仍有内容待处理' : '导入完成';
+			const breakdown = Object.entries(failuresByStep).map(([step, amount]) => `${step} ${amount} 篇`).join('、');
+			const details = breakdown ? ` 失败环节：${breakdown}。` : '';
+			const attachments = partial ? ` 已写入的笔记中有 ${partial} 篇图片待补齐。` : '';
+			const summary = `${status}。保存位置：${fileManager.destination}。共 ${total} 篇，写入 ${count} 篇，已在本地且无变化 ${skipped} 篇，待解密 ${locked} 篇，失败 ${failed} 篇。${attachments}${details}`;
+			await settingsStore.actions.setImportResult(fileManager.destination, summary, synced);
+			const hint = locked || partial ? '请保持已验证的小米云笔记网页打开，再重试导入。' : '';
+			new Notice(summary + hint, 15000);
+		} catch {
+			const summary = `导入中断。保存位置：${noteLocation}。请检查小米云登录、网络及保存目录后重试。`;
+			settingsStore.actions.setImportResult(noteLocation, summary);
+			new Notice(summary, 15000);
 		} finally {
+			progress.hide();
+			importProgress.set('');
 			this.syncing = false;
 		}
 	}

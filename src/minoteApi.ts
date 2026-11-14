@@ -55,8 +55,9 @@ export default class MinoteApi {
 	}
 
 	async fetchPage(syncTag = '') {
+		const query = new URLSearchParams({ ts: String(Date.now()), syncTag, limit: '200' });
 		const req: RequestUrlParam = {
-			url: this.getBaseUrl() + `/note/full/page?ts=${Date.now()}&syncTag=${syncTag}&limit=200`,
+			url: this.getBaseUrl() + '/note/v2/full/page?' + query,
 			method: 'GET',
 			headers: this.getHeaders()
 		};
@@ -66,7 +67,7 @@ export default class MinoteApi {
 
 	async fetchNoteDetails(noteId: string) {
 		const req: RequestUrlParam = {
-			url: this.getBaseUrl() + `/note/note/${noteId}/?ts=${Date.now()}`,
+			url: this.getBaseUrl() + `/note/v2/note/${encodeURIComponent(noteId)}/?ts=${Date.now()}`,
 			method: 'GET',
 			headers: this.getHeaders()
 		};
@@ -76,11 +77,15 @@ export default class MinoteApi {
 
 	async fetchImage(fileId: string) {
 		const req: RequestUrlParam = {
-			url: this.getBaseUrl() + `/file/full?type=note_img&fileid=${fileId}`,
+			url: this.getBaseUrl() + `/file/full?type=note_img&fileid=${encodeURIComponent(fileId)}`,
 			method: 'GET',
 			headers: this.getHeaders()
 		};
 		const resp = await requestUrl(req);
+		const type = Object.entries(resp.headers).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+		if (!resp.arrayBuffer.byteLength || /(?:json|text\/html)/i.test(type || '')) {
+			throw new Error('Image download did not return an attachment');
+		}
 		return resp.arrayBuffer;
 	}
 }
