@@ -4,6 +4,15 @@ import type { Note } from './models';
 const frontmatter = /^(?:\uFEFF)?---[ \t]*\r?\n((?:[^\r\n]*\r?\n)*?)---[ \t]*(?:\r?\n|$)/;
 const chinaOffset = 8 * 60 * 60 * 1000;
 
+export function readNoteId(markdown: string): string | undefined {
+	const existing = frontmatter.exec(markdown);
+	if (!existing) return undefined;
+	const document = parseDocument(existing[1], { intAsBigInt: true });
+	if (document.errors.length || !isMap(document.contents)) return undefined;
+	const id = document.get('noteId');
+	return typeof id === 'string' || typeof id === 'bigint' ? String(id) : undefined;
+}
+
 export function formatTime(value: number): string | undefined {
 	if (!Number.isFinite(value)) return undefined;
 	const time = new Date(value + chinaOffset);

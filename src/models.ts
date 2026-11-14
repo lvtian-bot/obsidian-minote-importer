@@ -35,4 +35,5 @@ export interface SyncInfo {
 	imageFormatChecked?: boolean;
 	attachmentsPending?: boolean;
 	pendingMove?: string;
+	account?: string;
 }

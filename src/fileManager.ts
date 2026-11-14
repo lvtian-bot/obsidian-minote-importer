@@ -70,7 +70,44 @@ export default class FileManager {
 			return;
 		}
 
-		await this.adapter.remove(this.vaultPath(filePath));
+		await this.adapter.trashLocal(this.vaultPath(filePath));
+	}
+
+	async deleteEmptyFolder(folderPath: string): Promise<void> {
+		if (!await this.exists(folderPath)) return;
+		const children = await this.adapter.list(this.vaultPath(folderPath));
+		if (!children.files.length && !children.folders.length) {
+			// 只删除已确认空的目录，禁止递归删除。
+			await this.adapter.rmdir(this.vaultPath(folderPath), false);
+		}
+	}
+
+	async unreferencedImages(candidates: string[]): Promise<string[]> {
+		if (!candidates.length) return [];
+		const unused = new Set(candidates);
+		const files = new Set<string>();
+		const directories = [''];
+		while (directories.length) {
+			const children = await this.adapter.list(directories.pop()!);
+			for (const file of children.files) if (/\.md$/i.test(file)) files.add(file);
+			for (const folder of children.folders) if (folder !== '.trash') directories.push(folder);
+		}
+		const knownImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
+		for (const file of files) {
+			if (!await this.adapter.exists(file)) continue;
+			const markdown = await this.adapter.read(file);
+			const referenced = new Set([...markdown.matchAll(knownImage)].map(match =>
+				normalizePath(path.posix.join(path.posix.dirname(file), 'img', match[1])).toLowerCase()));
+			// 非插件生成的链接按文件名保守保留，覆盖双链、HTML、引用式链接及转义路径。
+			const otherLinks = markdown.replace(knownImage, '').replace(/(?:%[a-f\d]{2})+/gi, encoded => {
+				try { return decodeURIComponent(encoded); } catch { return encoded; }
+			}).toLowerCase();
+			for (const candidate of unused) {
+				if (referenced.has(this.vaultPath(candidate).toLowerCase())
+					|| otherLinks.includes(path.posix.basename(candidate).toLowerCase())) unused.delete(candidate);
+			}
+		}
+		return [...unused];
 	}
 
 	async moveFile(oldPath: string, newPath: string): Promise<void> {
