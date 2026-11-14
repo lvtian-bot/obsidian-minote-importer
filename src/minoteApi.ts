@@ -7,6 +7,7 @@ import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from 'obsid
 import { get } from 'svelte/store';
 
 import { settingsStore } from './settings';
+import { createHash } from 'crypto';
 
 export interface ProfileCheckResult {
 	ok: boolean;
@@ -14,12 +15,20 @@ export interface ProfileCheckResult {
 }
 
 export default class MinoteApi {
+	// 固定本轮使用的会话，避免分页期间切换登录导致清单混入其他账号。
+	constructor(private readonly session = { host: get(settingsStore).host, cookie: get(settingsStore).cookie }) {}
 
-	private getBaseUrl() {
-		return `https://${get(settingsStore).host}`;
+	get accountKey(): string {
+		const ids = [...this.session.cookie.matchAll(/(?:^|;\s*)userId=(\d+)(?=;|$)/g)].map(match => match[1]);
+		if (!ids.length || new Set(ids).size !== 1) return '';
+		return createHash('sha256').update(this.session.host + ':' + ids[0]).digest('hex');
 	}
 
-	private getHeaders(cookie = get(settingsStore).cookie) {
+	private getBaseUrl() {
+		return `https://${this.session.host}`;
+	}
+
+	private getHeaders(cookie = this.session.cookie) {
 		return {
 			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.103 Safari/537.36',
 			'Accept-Encoding': 'gzip, deflate, br',

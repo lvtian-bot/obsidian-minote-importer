@@ -134,7 +134,7 @@ export default class MinotePlugin extends Plugin {
 			const noteSyncer = new NoteSyncer(fileManager, new MinoteApi(), this.externalLogin,
 				record => settingsStore.actions.checkpointMove(fileManager.destination, record));
 			let nextUpdate = 0;
-			const { total, count, skipped, locked, failed, partial, failuresByStep, synced } = await noteSyncer.sync(force, result => {
+			const { total, count, skipped, locked, failed, partial, deleted, failuresByStep, synced } = await noteSyncer.sync(force, result => {
 				const processed = result.count + result.skipped + result.locked + result.failed;
 				if (Date.now() < nextUpdate && processed < result.total) return;
 				nextUpdate = Date.now() + 500;
@@ -146,7 +146,7 @@ export default class MinotePlugin extends Plugin {
 			const breakdown = Object.entries(failuresByStep).map(([step, amount]) => `${step} ${amount} 篇`).join('、');
 			const details = breakdown ? ` 失败环节：${breakdown}。` : '';
 			const attachments = partial ? ` 已写入的笔记中有 ${partial} 篇图片待补齐。` : '';
-			const summary = `${status}。保存位置：${fileManager.destination}。共 ${total} 篇，写入 ${count} 篇，已在本地且无变化 ${skipped} 篇，待解密 ${locked} 篇，失败 ${failed} 篇。${attachments}${details}`;
+			const summary = `${status}。保存位置：${fileManager.destination}。共 ${total} 篇，写入 ${count} 篇，已在本地且无变化 ${skipped} 篇，待解密 ${locked} 篇，失败 ${failed} 篇，移至回收站 ${deleted} 篇。${attachments}${details}`;
 			await settingsStore.actions.setImportResult(fileManager.destination, summary, synced);
 			const hint = locked || partial ? '请保持已验证的小米云笔记网页打开，再重试导入。' : '';
 			new Notice(summary + hint, 15000);
