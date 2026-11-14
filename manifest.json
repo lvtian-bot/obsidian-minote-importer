@@ -1,7 +1,7 @@
 {
 	"id": "minote-importer",
 	"name": "Minote Importer",
-	"version": "0.1.14",
+	"version": "0.2.0",
 	"minAppVersion": "0.15.0",
 	"description": "将小米云笔记单向导入 Obsidian，保存为 Markdown 文件。",
 	"author": "lvtian-bot",
