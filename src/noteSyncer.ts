@@ -9,13 +9,13 @@ import { get } from 'svelte/store';
 import { settingsStore } from './settings';
 import FileManager from './fileManager';
 import MinoteApi from './minoteApi';
-import type ExternalLoginService from './externalLogin';
+import { assertImportActive, isTaskInterruption, ImportCancelledError, WebSessionError, waitFor, type ImportControl } from './importControl';
 import { isEncryptedNoteContent } from './webNote';
 import { formatTime, readNoteId, withNoteProperties } from './noteProperties';
 import path from 'path';
-import type { Note, Folder, SyncInfo, ImageInfo } from './models';
+import type { Note, Folder, SyncInfo, ImageInfo, NoteContentReader } from './models';
 
-const originalImage = /☺[^\S\r\n]+[^\s<]+|<img\b[^>]*\bfileid=/i;
+const originalImage = /☺[^\S\r\n]+[^\s<]+|<img\b[^>]*\bfileid=|https?:\/\/com\.miui\.notes\/image\//i;
 const localImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
 const cloudNoteTypes = new Set(['note', 'mdNote', 'mindMap']);
 
@@ -28,6 +28,8 @@ interface ImportCounts {
 	partial: number;
 	deleted: number;
 	failuresByStep: Record<string, number>;
+	cancelled?: boolean;
+	interrupted?: string;
 }
 
 export default class NoteSyncer {
@@ -42,15 +44,19 @@ export default class NoteSyncer {
 	private account = '';
 	private images = new Map<string, SyncInfo>();
 	private oldFolders = new Map<string, SyncInfo>();
+	private control: ImportControl = {};
+	private progressResult?: ImportCounts;
 
-	constructor(fileManager: FileManager, minoteApi: MinoteApi, private readonly externalLogin: ExternalLoginService,
+	constructor(fileManager: FileManager, minoteApi: MinoteApi, private readonly contentReader: NoteContentReader,
 		private readonly checkpointMove?: (record: SyncInfo) => Promise<void>) {
 		this.fileManager = fileManager;
 		this.minoteApi = minoteApi;
 	}
 
-	public async sync(force: boolean, onProgress: (result: ImportCounts) => void) {
+	public async sync(force: boolean, onProgress: (result: ImportCounts) => void, control: ImportControl = {}) {
 		this.clear();
+		this.control = control;
+		this.progressResult = undefined;
 
 		const settings = get(settingsStore);
 		this.account = this.minoteApi.accountKey;
@@ -67,19 +73,35 @@ export default class NoteSyncer {
 				return acc;
 			}, {});
 
-		await this.fetchNotesAndFolders();
-		const folderIds = new Set(['0', ...this.folders.map(folder => folder.id)]);
-		if (this.notes.some(note => !folderIds.has(note.folderId))) throw new Error('Incomplete cloud folder inventory');
-		this.adoptLegacyHistory();
-		await this.createFolders();
-		const result = await this.syncNotes(force, onProgress);
-		await this.cleanRemovedContent(result);
+		let result: ImportCounts = { total: 0, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {} };
+		try {
+			await this.assertActive();
+			await this.fetchNotesAndFolders();
+			result.total = this.notes.length;
+			const folderIds = new Set(['0', ...this.folders.map(folder => folder.id)]);
+			if (this.notes.some(note => !folderIds.has(note.folderId))) throw new Error('Incomplete cloud folder inventory');
+			this.adoptLegacyHistory();
+			await this.assertActive();
+			await this.createFolders();
+			result = await this.syncNotes(force, onProgress);
+			await this.assertActive();
+			// 正文或附件未处理完时，整轮跳过清理，留待下次完整导入后处理。
+			if (!result.locked && !result.failed && !result.partial) await this.cleanRemovedContent(result);
+		} catch (error) {
+			if (!isTaskInterruption(error) && !control.signal?.aborted) throw error;
+			result = this.progressResult ?? result;
+			result.cancelled = error instanceof ImportCancelledError || !!control.signal?.aborted;
+			result.interrupted = result.cancelled ? '导入已取消'
+				: error instanceof WebSessionError ? error.message : '小米笔记连接已变化，导入已停止';
+		}
 
 		const tracked = new Set(this.thisTimeSynced.filter(item => item.type === 'note').map(item => item.id));
 		const retained = Object.values(this.lastSyncedNotes).filter(item => !tracked.has(item.id));
 		const foreign = this.history.filter(item => item.account && item.account !== this.account);
 		return { ...result, synced: [...this.thisTimeSynced, ...retained, ...this.images.values(), ...this.oldFolders.values(), ...foreign] };
 	}
+
+	private assertActive(): Promise<void> { return assertImportActive(this.control); }
 
 	private adoptLegacyHistory() {
 		const cloudIds = new Set(this.notes.map(note => note.id));
@@ -111,8 +133,9 @@ export default class NoteSyncer {
 		const seenFolders = new Set<string>();
 		const pageTokens = new Set<string>();
 		// 获取第一页
-		let page = await this.minoteApi.fetchPage();
+		let page = await waitFor(this.minoteApi.fetchPage(), 30_000, this.control.signal);
 		while (true) {
+			await this.assertActive();
 			if ((page.code !== undefined && page.code !== 0) || !Array.isArray(page.data?.entries)
 				|| !Array.isArray(page.data?.folders) || typeof page.data.lastPage !== 'boolean') {
 				throw new Error('Invalid Xiaomi Notes inventory');
@@ -171,7 +194,8 @@ export default class NoteSyncer {
 				throw new Error('Xiaomi Notes pagination stopped advancing');
 			}
 			pageTokens.add(token);
-			page = await this.minoteApi.fetchPage(token);
+			await this.assertActive();
+			page = await waitFor(this.minoteApi.fetchPage(token), 30_000, this.control.signal);
 		}
 	}
 
@@ -202,6 +226,7 @@ export default class NoteSyncer {
 		const usedNames = new Set<string>();
 		// Reserve the default category before allocating names for cloud folders.
 		for (const folder of this.folders) {
+			await this.assertActive();
 			for (const previous of this.oldFolders.values()) {
 				if (previous.id === folder.id && this.account) previous.account = this.account;
 			}
@@ -232,6 +257,7 @@ export default class NoteSyncer {
 		const result: ImportCounts = {
 			total: this.notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {}
 		};
+		this.progressResult = result;
 		onProgress(result);
 
 		// 记录此次同步信息
@@ -239,6 +265,7 @@ export default class NoteSyncer {
 			const previous = this.lastSyncedNotes[note.id];
 			let step = '检查本地文件';
 			try {
+				await this.assertActive();
 				if (previous && this.account) previous.account = this.account;
 				if (previous) await this.recoverPendingMove(previous);
 				const folder = this.folderDict[note.folderId];
@@ -264,12 +291,13 @@ export default class NoteSyncer {
 						markdown => withNoteProperties(markdown, note, folder.category));
 					if (renamed || updated) result.count++;
 					else result.skipped++;
-					this.thisTimeSynced.push({ ...previous, name: note.title, decoded: previous.decoded ?? false, imageFormatChecked: true });
+					this.thisTimeSynced.push({ ...previous, name: note.title, decoded: previous.decoded ?? false, imageFormatChecked: true, imageFormatVersion: 2 });
 					continue;
 				}
 
 				step = '读取云端正文';
-				const noteDetails = await this.minoteApi.fetchNoteDetails(note.id);
+				const noteDetails = await waitFor(this.minoteApi.fetchNoteDetails(note.id), 30_000, this.control.signal);
+				await this.assertActive();
 				const entry = noteDetails.data?.entry;
 				if (typeof entry?.content !== 'string' || String(entry.id) !== note.id
 					|| this.isPrivate(String(entry.folderId), this.readExtraInfo(entry.extraInfo).isPrivate)) {
@@ -277,7 +305,7 @@ export default class NoteSyncer {
 				}
 				const encrypted = note.encrypted || Boolean(entry.encryptInfo) || isEncryptedNoteContent(entry.content);
 				let content: string | null = encrypted && entry.content
-					? await this.externalLogin.readEncryptedNote({ id: note.id, content: entry.content, encryptInfo: entry.encryptInfo })
+					? await this.contentReader.readEncryptedNote({ id: note.id, content: entry.content, encryptInfo: entry.encryptInfo })
 					: entry.content;
 				if (content === null || (encrypted && entry.content && (content === entry.content || isEncryptedNoteContent(content)))) {
 					result.locked++;
@@ -315,7 +343,9 @@ export default class NoteSyncer {
 							if (await this.fileManager.hasBinaryFile(source)) this.trackImage(source);
 						}
 						imgDict.set(image.fileId, fileName);
-					} catch {
+						if (image.digest) imgDict.set(image.digest.toLowerCase(), fileName);
+					} catch (error) {
+						if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
 						attachmentsPending = true;
 					}
 				}
@@ -344,6 +374,9 @@ export default class NoteSyncer {
 
 				// 规则5: 移除<new-format/>标签
 				content = content.replace(/<new-format\/>/g, '');
+				// Markdown 笔记按摘要引用图片，与旧 XML 中的 fileId 不同。
+				content = content.replace(/https?:\/\/com\.miui\.notes\/image\/([a-f\d]{40})(?:\?[^\s)<>"']*)?/gi,
+					(url, digest: string) => imgDict.has(digest.toLowerCase()) ? 'img/' + imgDict.get(digest.toLowerCase()) : url);
 				attachmentsPending ||= originalImage.test(content);
 
 				// 保存转换后的内容
@@ -381,9 +414,11 @@ export default class NoteSyncer {
 					syncTime: note.modifyDate,
 					decoded: encrypted,
 					imageFormatChecked: true,
+					imageFormatVersion: 2,
 					attachmentsPending
 				});
-			} catch {
+			} catch (error) {
+				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
 				result.failed++;
 				result.failuresByStep[step] = (result.failuresByStep[step] || 0) + 1;
 				if (previous) {
@@ -401,7 +436,7 @@ export default class NoteSyncer {
 		if (!await this.fileManager.exists(previous.relativePath)
 			|| this.pathOwnedByAnother(note.id, previous.relativePath)) return false;
 		if (previous.attachmentsPending) return false;
-		if (previous.imageFormatChecked && previous.decoded !== undefined) return true;
+		if (previous.imageFormatVersion === 2 && previous.decoded !== undefined) return true;
 		const content = await this.fileManager.readFile(previous.relativePath);
 		return !isEncryptedNoteContent(content) && !originalImage.test(content);
 	}
@@ -466,6 +501,7 @@ export default class NoteSyncer {
 	}
 
 	private async cleanRemovedContent(result: ImportCounts) {
+		await this.assertActive();
 		const cloudIds = new Set(this.notes.map(note => note.id));
 		const stale = Object.values(this.lastSyncedNotes).filter(item => !cloudIds.has(item.id));
 		const fail = (step: string) => {
@@ -479,6 +515,7 @@ export default class NoteSyncer {
 		}
 		for (const previous of stale) {
 			try {
+				await this.assertActive();
 				await this.recoverPendingMove(previous);
 				const file = previous.relativePath;
 				if (await this.fileManager.exists(file)) {
@@ -488,28 +525,39 @@ export default class NoteSyncer {
 					result.deleted++;
 				}
 				delete this.lastSyncedNotes[previous.id];
-			} catch { fail('检查本地文件'); }
+			} catch (error) {
+				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
+				fail('检查本地文件');
+			}
 		}
 		// 待解密或写入失败时保留附件，避免根据不完整的正文判断图片已经无引用。
 		if (!result.locked && !result.partial && !result.failed) {
 			try {
 				const unused = await this.fileManager.unreferencedImages([...this.images.values()].map(item => item.relativePath));
 				for (const image of unused) {
+					await this.assertActive();
 					await this.fileManager.deleteFile(image);
 					this.images.delete(this.pathKey(image));
 					await this.fileManager.deleteEmptyFolder(path.posix.dirname(image));
 				}
-			} catch { fail('处理图片'); }
+			} catch (error) {
+				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
+				fail('处理图片');
+			}
 		}
 		const currentFolders = new Set(this.thisTimeSynced.filter(item => item.type === 'folder').map(item => this.pathKey(item.relativePath)));
 		for (const [key, folder] of this.oldFolders) {
+			await this.assertActive();
 			if (currentFolders.has(key)) { this.oldFolders.delete(key); continue; }
 			if (folder.account !== this.account) continue;
 			try {
 				await this.fileManager.deleteEmptyFolder(path.posix.join(folder.relativePath, 'img'));
 				await this.fileManager.deleteEmptyFolder(folder.relativePath);
 				if (!await this.fileManager.exists(folder.relativePath)) this.oldFolders.delete(key);
-			} catch { fail('更新本地分类'); }
+			} catch (error) {
+				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
+				fail('更新本地分类');
+			}
 		}
 	}
 
@@ -555,9 +603,9 @@ export default class NoteSyncer {
 		if (await this.fileManager.hasBinaryFile(imgPath)) {
 			return;
 		}
-		const webImage = await this.externalLogin.readImage(image);
+		const webImage = await this.contentReader.readImage(image);
 		if (!webImage && encrypted) throw new Error('Encrypted image unavailable');
-		const imgBinary = webImage ?? await this.minoteApi.fetchImage(image.fileId);
+		const imgBinary = webImage ?? await waitFor(this.minoteApi.fetchImage(image.fileId), 45_000, this.control.signal);
 		await this.fileManager.saveBinaryFile(imgPath, imgBinary);
 	}
 }

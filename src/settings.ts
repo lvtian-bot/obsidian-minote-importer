@@ -2,37 +2,30 @@
  * @file 插件配置
  * @author Emac
  */
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { normalizePath } from 'obsidian';
 
-import MinotePlugin from 'main';
+import type MinotePlugin from 'main';
 import type { SyncInfo } from './models';
 
 interface MinotePluginSettings {
 	noteLocation: string;
 	host: string;
-	cookie: string;
-	isCookieValid: boolean;
-	webLoginConfirmed: boolean;
+	accountLoggedIn: boolean;
 	user: string;
 	lastTimeSynced: SyncInfo[];
 	lastImportDestination: string;
 	lastImportSummary: string;
-	// 外部浏览器登录
-	browserPath: string;
 };
 
 const DEFAULT_SETTINGS: MinotePluginSettings = {
 	noteLocation: 'minote-importer',
 	host: 'i.mi.com',
-	cookie: '',
-	isCookieValid: false,
-	webLoginConfirmed: false,
+	accountLoggedIn: false,
 	user: '',
 	lastTimeSynced: [],
 	lastImportDestination: '',
 	lastImportSummary: '',
-	browserPath: '',
 };
 
 const createSettingsStore = () => {
@@ -44,19 +37,20 @@ const createSettingsStore = () => {
 	const initialize = async (plugin: MinotePlugin): Promise<void> => {
 		_plugin = plugin;
 
-		const data = Object.assign({}, DEFAULT_SETTINGS, await plugin.loadData());
+		const raw = await plugin.loadData() ?? {};
+		// 不迁移旧浏览器认证；保留其他配置及导入记录，首次保存即移除旧凭据。
+		const { cookie: _cookie, webLoginConfirmed: _confirmed, isCookieValid: _valid, browserPath: _browser, ...safe } = raw;
+		const data = Object.assign({}, DEFAULT_SETTINGS, safe);
 		const settings: MinotePluginSettings = { ...data };
 		settings.noteLocation = normalizePath(settings.noteLocation);
 		if (!settings.lastImportDestination && settings.lastTimeSynced.length) {
 			// Legacy records have relative paths. Recheck them under the saved destination.
 			settings.lastImportDestination = settings.noteLocation;
 		}
-		if (!settings.webLoginConfirmed) {
-			settings.cookie = '';
-			settings.isCookieValid = false;
-			settings.user = '';
-		}
+		if (!settings.accountLoggedIn) settings.user = '';
+		runtimeCredentials.set('');
 		store.set(settings);
+		await pendingSave;
 	};
 
 	store.subscribe(settings => {
@@ -73,12 +67,11 @@ const createSettingsStore = () => {
 	};
 
 	const setHost = (value: string) => {
+		runtimeCredentials.set('');
 		store.update((state) => {
 			if (state.host !== value) {
 				state.host = value;
-				state.cookie = '';
-				state.isCookieValid = false;
-				state.webLoginConfirmed = false;
+				state.accountLoggedIn = false;
 				state.user = '';
 			}
 			return state;
@@ -86,30 +79,22 @@ const createSettingsStore = () => {
 	};
 
 	const clearCookie = () => {
+		runtimeCredentials.set('');
 		store.update((state) => {
-			state.cookie = '';
-			state.isCookieValid = false;
-			state.webLoginConfirmed = false;
+			state.accountLoggedIn = false;
 			state.user = '';
 			return state;
 		});
 	};
 
-	const setLogin = (cookie: string, user: string) => {
-		store.update((state) => {
-			state.cookie = cookie;
-			state.isCookieValid = true;
-			state.webLoginConfirmed = true;
-			state.user = user;
-			return state;
-		});
+	const setAccountState = (loggedIn: boolean, user: string) => {
+		const state = get(store);
+		if (state.accountLoggedIn === loggedIn && state.user === user) return;
+		store.set({ ...state, accountLoggedIn: loggedIn, user });
 	};
-
-	const setBrowserPath = (value: string) => {
-		store.update((state) => {
-			state.browserPath = value;
-			return state;
-		});
+	const setLogin = (cookie: string, user: string) => {
+		runtimeCredentials.set(cookie);
+		setAccountState(true, user);
 	};
 
 	const checkpointMove = (destination: string, record: SyncInfo) => {
@@ -118,7 +103,8 @@ const createSettingsStore = () => {
 			lastImportDestination: destination,
 			lastTimeSynced: [
 				...state.lastTimeSynced.filter(item => state.lastImportDestination === destination
-					&& (item.type !== 'note' || (item.id !== record.id && item.relativePath !== record.relativePath))),
+					&& (item.type !== 'note' || (item.account && item.account !== record.account)
+						|| (item.id !== record.id && item.relativePath !== record.relativePath))),
 				record,
 			],
 		}));
@@ -142,12 +128,14 @@ const createSettingsStore = () => {
 			setHost,
 			clearCookie,
 			setLogin,
-			setBrowserPath,
+			setAccountState,
 			setImportResult,
 			checkpointMove,
 		}
 	}
 };
 
+// 仅供本轮请求使用；不属于任何 saveData 的数据对象。
+export const runtimeCredentials = writable('');
 export const settingsStore = createSettingsStore()
 export const importProgress = writable('');

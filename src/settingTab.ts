@@ -9,15 +9,15 @@ import { get } from 'svelte/store';
 
 import MinotePlugin from 'main';
 import { importProgress, settingsStore } from './settings';
-import type ExternalLoginService from './externalLogin';
+import type MinoteWebSession from './minoteWebSession';
 
 export class MinoteSettingTab extends PluginSettingTab {
 	private unsubscribeBrowser?: () => void;
 	private unsubscribeImport?: () => void;
 	private unsubscribeDestination?: () => void;
 
-	constructor(app: App, plugin: MinotePlugin, private readonly externalLogin: ExternalLoginService) {
-		super(app, plugin);
+	constructor(app: App, private readonly minotePlugin: MinotePlugin, private readonly webSession: MinoteWebSession) {
+		super(app, minotePlugin);
 	}
 
 	display(): void {
@@ -52,54 +52,34 @@ export class MinoteSettingTab extends PluginSettingTab {
 	}
 
 	private showLogin(): void {
-		const login = new Setting(this.containerEl);
-		login.addButton(button => button
-			.setButtonText('打开小米云网页')
-			.onClick(async () => {
-				const result = await this.externalLogin.startLogin();
-				new Notice(result.message);
-			}))
-			.addButton(button => button
-				.setButtonText('确认已完成验证')
-				.setCta()
+		const row = new Setting(this.containerEl).setName('小米账号');
+		let rendered = '';
+		const update = () => {
+			const state = get(this.webSession.accountState);
+			row.setDesc(state.loggedIn ? `已登录 · ${state.nickname}` : '未登录');
+			row.settingEl.setAttribute('aria-busy', String(state.checking));
+			const key = `${state.loggedIn}:${state.nickname}:${this.minotePlugin.isImporting()}`;
+			if (key === rendered) return;
+			rendered = key;
+			row.controlEl.empty();
+			row.addButton(button => button.setButtonText(state.loggedIn ? '打开小米笔记' : '登录')
 				.onClick(async () => {
-					button.setDisabled(true);
 					try {
-						const result = await this.externalLogin.confirmLogin();
-						new Notice(result.message);
-					} finally {
-						button.setDisabled(false);
+						await this.minotePlugin.openMinote();
+						(this.app as App & { setting?: { close(): void } }).setting?.close();
 					}
+					catch { new Notice('无法打开小米笔记，请重试。'); }
 				}));
-		const logout = new Setting(this.containerEl)
-			.setName('退出登录')
-			.setDesc('清除此笔记库的插件登录状态和专用浏览器数据。')
-			.addButton(button => button.setButtonText('退出').onClick(async () => {
-				button.setDisabled(true);
-				await this.externalLogin.logout();
-				this.display();
-			}));
-		const updateStatus = () => {
-			const status = get(this.externalLogin.loginStatus);
-			const { isCookieValid } = get(settingsStore);
-			logout.settingEl.toggle(isCookieValid);
-			if (status === 'confirmed') {
-				login.setName('小米云已登录').setDesc('可以导入笔记。导入加密笔记期间请保持网页打开。');
-			} else if (status === 'waiting') {
-				login.setName('等待小米云网页验证').setDesc('网页能打开笔记正文后，如果这里仍在等待，请保持网页打开，再点「确认已完成验证」。');
-			} else if (status === 'timed-out') {
-				login.setName('等待登录超时').setDesc('如果网页已能打开笔记，请点「确认已完成验证」。');
-			} else if (isCookieValid) {
-				login.setName('小米云已登录，网页已关闭').setDesc('可以导入普通笔记。导入加密笔记前请重新打开网页。');
-			} else if (status === 'closed') {
-				login.setName('小米云网页已关闭').setDesc('请重新打开网页，等 Obsidian 显示已登录。');
-			} else {
-				login.setName('登录小米云').setDesc('点击打开网页，在小米网页完成验证即可。');
-			}
+			if (state.loggedIn) row.addButton(button => button.setButtonText('退出登录')
+				.setDisabled(this.minotePlugin.isImporting()).onClick(async () => {
+					button.setDisabled(true);
+					await this.minotePlugin.logout();
+					button.setDisabled(this.minotePlugin.isImporting());
+				}));
 		};
-		const stopStatus = this.externalLogin.loginStatus.subscribe(updateStatus);
-		const stopSettings = settingsStore.subscribe(updateStatus);
-		this.unsubscribeBrowser = () => { stopStatus(); stopSettings(); };
+		const stopAccount = this.webSession.accountState.subscribe(update);
+		const stopProgress = importProgress.subscribe(update);
+		this.unsubscribeBrowser = () => { stopAccount(); stopProgress(); };
 	}
 
 	private notebookFolder(): void {
@@ -145,27 +125,15 @@ export class MinoteSettingTab extends PluginSettingTab {
 				return dropdown
 					.setValue(get(settingsStore).host)
 					.onChange(async (value) => {
-						if (this.externalLogin.isRunning()) {
-							new Notice('请先关闭登录窗口，再切换小米云服务域名');
+						if (this.minotePlugin.isImporting()) {
+							new Notice('请先取消导入，再切换小米云服务域名。');
 							this.display();
 							return;
 						}
-						settingsStore.actions.setHost(value);
+						await this.minotePlugin.switchHost(value);
 						this.display();
 					});
 			});
 
-		const detectedBrowser = this.externalLogin.detectBrowserPath();
-		new Setting(advancedSettings)
-			.setName('外部浏览器可执行文件')
-			.setDesc(`留空时自动检测。当前检测到：${detectedBrowser || '未找到，请手动填写完整路径'}`)
-			.addText((text) => {
-				return text
-					.setPlaceholder('例如：C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe')
-					.setValue(get(settingsStore).browserPath)
-					.onChange(async (value) => {
-						settingsStore.actions.setBrowserPath(value.trim());
-					});
-			});
 	}
 }

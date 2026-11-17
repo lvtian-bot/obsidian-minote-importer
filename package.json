@@ -25,13 +25,11 @@
 		"svelte-check": "^4.1.1",
 		"svelte-preprocess": "^6.0.3",
 		"tslib": "2.4.0",
-		"typescript": "~5.0.0",
-		"@types/ws": "^8.5.12"
+		"typescript": "~5.0.0"
 	},
 	"dependencies": {
 		"@types/lodash.pickby": "^4.6.7",
 		"lodash.pickby": "^4.6.0",
-		"ws": "^8.18.0",
 		"yaml": "^2.9.1"
 	},
 	"repository": {

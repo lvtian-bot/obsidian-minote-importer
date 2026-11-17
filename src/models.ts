@@ -25,6 +25,11 @@ export interface ImageInfo {
 	digest?: string;
 }
 
+export interface NoteContentReader {
+	readEncryptedNote(note: { id: string; content: string; encryptInfo: unknown }): Promise<string | null>;
+	readImage(image: { fileId: string; digest?: string }): Promise<ArrayBuffer | null>;
+}
+
 export interface SyncInfo {
 	id: string;
 	type: string;
@@ -33,6 +38,7 @@ export interface SyncInfo {
 	syncTime: number;
 	decoded?: boolean;
 	imageFormatChecked?: boolean;
+	imageFormatVersion?: number;
 	attachmentsPending?: boolean;
 	pendingMove?: string;
 	account?: string;
