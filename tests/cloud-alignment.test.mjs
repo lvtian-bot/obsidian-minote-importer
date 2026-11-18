@@ -172,7 +172,94 @@ for (const force of [false, true]) {
     assert.equal(result.deleted, 1);
     assert.equal(env.vault.folders.has('导入/分类'), false);
   });
+
+  test(`${mode}按北京时间取创建日期与所选文件夹的交集`, async () => {
+    const from = Date.parse('2026-11-18T00:00:00+08:00');
+    const until = Date.parse('2026-11-19T00:00:00+08:00');
+    const entries = [
+      cloudNote('101', '当天第一篇', '10', { createDate: from }),
+      cloudNote('102', '当天最后一篇', '0', { createDate: until - 1 }),
+      cloudNote('103', '前一天', '10', { createDate: from - 1, modifyDate: from }),
+      cloudNote('104', '后一天', '10', { createDate: until }),
+      cloudNote('105', '其他文件夹', '20', { createDate: from }),
+    ];
+    const env = await setup({ entries, folders: [cloudFolder(), cloudFolder('20', '其他')] });
+    settingsStore.actions.setImportOptions({ createdFrom: '2026-11-18', createdThrough: '2026-11-18',
+      folderSelection: { account: env.api.accountKey, ids: ['10', '0'] } });
+    const result = await env.sync(force);
+    assert.equal(result.total, 2);
+    assert.equal(result.failed, 0);
+    assert.deepEqual(env.detailCalls, ['101', '102']);
+    assert.deepEqual([...env.vault.files.keys()], ['导入/分类/当天第一篇.md', '导入/未分类/当天最后一篇.md']);
+    assert.equal(env.vault.folders.has('导入/其他'), false);
+  });
 }
+
+test('缩小范围时复制模式保留历史及图片，改用镜像模式后清理已移出范围或已删除的笔记', async () => {
+  const included = cloudNote('101', '保留');
+  const outside = cloudNote('102', '已移出范围', '20');
+  const deleted = cloudNote('103', '云端已删除', '20');
+  const env = await setup({ entries: [included, outside], folders: [cloudFolder(), cloudFolder('20', '其他')], files: {
+    '导入/其他/已移出范围.md': markdown(outside, '![](img/old.png)', '其他'),
+    '导入/其他/云端已删除.md': markdown(deleted, '正文', '其他'),
+    '导入/其他/img/old.png': '图片',
+    '导入/其他/自行创建.md': '自己的内容',
+  } });
+  await env.setHistory([env.record(outside, '其他/已移出范围.md'), env.record(deleted, '其他/云端已删除.md'),
+    env.folder('其他', '20'), env.image('其他/img/old.png')]);
+  settingsStore.actions.setImportOptions({ importMode: 'copy', folderSelection: { account: env.api.accountKey, ids: ['10'] } });
+  const copy = await env.sync();
+  assert.equal(copy.count, 1);
+  assert.equal(copy.deleted, 0);
+  assert.deepEqual(env.vault.trashed, []);
+  assert.ok(copy.synced.some(item => item.id === outside.id));
+  assert.ok(copy.synced.some(item => item.id === deleted.id));
+  settingsStore.actions.setImportOptions({ importMode: 'mirror' });
+  const mirror = await env.sync();
+  assert.equal(mirror.failed, 0);
+  assert.equal(mirror.deleted, 2);
+  assert.deepEqual(env.vault.trashed.sort(), ['导入/其他/img/old.png', '导入/其他/云端已删除.md', '导入/其他/已移出范围.md'].sort());
+  assert.deepEqual([...env.vault.files.keys()].sort(), ['导入/其他/自行创建.md', '导入/分类/保留.md'].sort());
+});
+
+test('所选文件夹没有匹配笔记时，镜像模式仍清理已确认归属的历史笔记', async () => {
+  const entry = cloudNote();
+  const env = await setup({ entries: [entry], folders: [cloudFolder()], files: { '导入/分类/笔记.md': markdown(entry) } });
+  await env.setHistory([env.record()]);
+  settingsStore.actions.setImportOptions({ folderSelection: { account: env.api.accountKey, ids: ['0'] } });
+  const result = await env.sync();
+  assert.equal(result.total, 0);
+  assert.equal(result.deleted, 1);
+  assert.equal(result.failed, 0);
+  assert.deepEqual(env.detailCalls, []);
+});
+
+test('其他账号的文件夹选择、无效日期范围和缺失的创建时间均阻止写入和清理', async () => {
+  const entry = cloudNote('101', '笔记', '10', { createDate: null });
+  const env = await setup({ entries: [entry], folders: [cloudFolder()], files: { '导入/分类/笔记.md': markdown() } });
+  await env.setHistory([env.record()]);
+  settingsStore.actions.setImportOptions({ folderSelection: { account: 'another-account', ids: ['10'] } });
+  await assert.rejects(env.sync(), /当前小米账号/);
+  settingsStore.actions.setImportOptions({ folderSelection: null, createdFrom: '2026-11-19', createdThrough: '2026-11-18' });
+  await assert.rejects(env.sync(), /开始日期不能晚于结束日期/);
+  settingsStore.actions.setImportOptions({ createdFrom: '2026-02-30', createdThrough: '' });
+  await assert.rejects(env.sync(), /有效的创建日期/);
+  settingsStore.actions.setImportOptions({ createdFrom: '2026-11-18' });
+  await assert.rejects(env.sync(), /小米笔记缺少有效的创建日期/);
+  assert.deepEqual(env.detailCalls, []);
+  assert.deepEqual(env.vault.writes, []);
+  assert.deepEqual(env.vault.trashed, []);
+});
+
+test('文件夹选择可读取全部分页，保留未分类与同名文件夹并排除私密文件夹', async () => {
+  const env = await setup({ pages: [
+    page([], [cloudFolder('2', '私密笔记'), cloudFolder('10', '文件夹')], false, 'next'),
+    page([], [cloudFolder('20', '文件夹'), cloudFolder('10', '文件夹')]),
+  ] });
+  assert.deepEqual([...await env.api.listFolders({})], [['0', '未分类'], ['10', '文件夹'], ['20', '文件夹']]);
+  assert.deepEqual(env.pageCalls, ['', 'next']);
+  assert.deepEqual(env.detailCalls, []);
+});
 
 test('正文修改时间未变时仍同步标题和文件名，并保留本地正文', async () => {
   const entry = cloudNote('101', '新标题');

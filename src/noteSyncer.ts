@@ -8,8 +8,9 @@ import { get } from 'svelte/store';
 
 import { settingsStore } from './settings';
 import FileManager from './fileManager';
-import MinoteApi from './minoteApi';
+import MinoteApi, { readCloudFolder } from './minoteApi';
 import { assertImportActive, isTaskInterruption, ImportCancelledError, WebSessionError, waitFor, type ImportControl } from './importControl';
+import { importFilter, type ImportOptions } from './importOptions';
 import { isEncryptedNoteContent } from './webNote';
 import { formatTime, readNoteId, withNoteProperties } from './noteProperties';
 import path from 'path';
@@ -53,7 +54,8 @@ export default class NoteSyncer {
 		this.minoteApi = minoteApi;
 	}
 
-	public async sync(force: boolean, onProgress: (result: ImportCounts) => void, control: ImportControl = {}) {
+	public async sync(force: boolean, onProgress: (result: ImportCounts) => void,
+		control: ImportControl = {}, options: ImportOptions = get(settingsStore)) {
 		this.clear();
 		this.control = control;
 		this.progressResult = undefined;
@@ -75,18 +77,22 @@ export default class NoteSyncer {
 
 		let result: ImportCounts = { total: 0, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {} };
 		try {
+			const matches = importFilter(options, this.account);
 			await this.assertActive();
 			await this.fetchNotesAndFolders();
-			result.total = this.notes.length;
 			const folderIds = new Set(['0', ...this.folders.map(folder => folder.id)]);
 			if (this.notes.some(note => !folderIds.has(note.folderId))) throw new Error('Incomplete cloud folder inventory');
-			this.adoptLegacyHistory();
+			const notes = matches ? this.notes.filter(matches) : this.notes;
+			result.total = notes.length;
+			this.adoptLegacyHistory(notes);
 			await this.assertActive();
-			await this.createFolders();
-			result = await this.syncNotes(force, onProgress);
+			await this.createFolders(matches ? new Set(notes.map(note => note.folderId)) : undefined);
+			result = await this.syncNotes(notes, force, onProgress);
 			await this.assertActive();
 			// 正文或附件未处理完时，整轮跳过清理，留待下次完整导入后处理。
-			if (!result.locked && !result.failed && !result.partial) await this.cleanRemovedContent(result);
+			if (options.importMode === 'mirror' && !result.locked && !result.failed && !result.partial) {
+				await this.cleanRemovedContent(new Set(notes.map(note => note.id)), result);
+			}
 		} catch (error) {
 			if (!isTaskInterruption(error) && !control.signal?.aborted) throw error;
 			result = this.progressResult ?? result;
@@ -103,13 +109,13 @@ export default class NoteSyncer {
 
 	private assertActive(): Promise<void> { return assertImportActive(this.control); }
 
-	private adoptLegacyHistory() {
+	private adoptLegacyHistory(notes: Note[]) {
 		const cloudIds = new Set(this.notes.map(note => note.id));
 		const claimCounts = new Map<string, number>();
 		for (const { legacyId } of this.notes) {
 			if (legacyId) claimCounts.set(legacyId, (claimCounts.get(legacyId) ?? 0) + 1);
 		}
-		for (const { id, legacyId } of this.notes) {
+		for (const { id, legacyId } of notes) {
 			if (!legacyId || !this.lastSyncedNotes[legacyId] || id === legacyId || this.lastSyncedNotes[id]) continue;
 			if (cloudIds.has(legacyId) || claimCounts.get(legacyId) !== 1) {
 				throw new Error('Conflicting legacy note IDs');
@@ -131,16 +137,8 @@ export default class NoteSyncer {
 	private async fetchNotesAndFolders() {
 		const seenNotes = new Set<string>();
 		const seenFolders = new Set<string>();
-		const pageTokens = new Set<string>();
-		// 获取第一页
-		let page = await waitFor(this.minoteApi.fetchPage(), 30_000, this.control.signal);
-		while (true) {
-			await this.assertActive();
-			if ((page.code !== undefined && page.code !== 0) || !Array.isArray(page.data?.entries)
-				|| !Array.isArray(page.data?.folders) || typeof page.data.lastPage !== 'boolean') {
-				throw new Error('Invalid Xiaomi Notes inventory');
-			}
-			for (const entry of page.data.entries) {
+		await this.minoteApi.readInventory(this.control, (entries, folders) => {
+			for (const entry of entries) {
 				if (!entry || !cloudNoteTypes.has(entry.type)) throw new Error('Unknown cloud note type');
 				if (cloudNoteTypes.has(entry.type)) {
 					const id = String(entry.id);
@@ -167,36 +165,17 @@ export default class NoteSyncer {
 				}
 			}
 
-			for (const entry of page.data.folders) {
-				if (!entry || entry.type !== 'folder' || !/^\d+$/.test(String(entry.id))) throw new Error('Invalid cloud folder');
-				if (entry.type === 'folder') {
-					const id = String(entry.id);
-					if (id === '0' || id === '2' || seenFolders.has(id)) continue;
-					seenFolders.add(id);
-					// 解析文件夹
-					const folder: Folder = {
-						id,
-						name: this.safeName(entry.subject) || '未命名分类',
-						category: entry.subject || '未命名分类',
-					};
-					this.folders.push(folder);
-				}
+			for (const entry of folders) {
+				const folder = readCloudFolder(entry);
+				if (!folder || seenFolders.has(folder.id)) continue;
+				seenFolders.add(folder.id);
+				this.folders.push({
+					id: folder.id,
+					name: this.safeName(folder.name) || '未命名分类',
+					category: folder.name,
+				});
 			}
-
-			// 检查是否需要获取下一页
-			if (page.data.lastPage) {
-				break;
-			}
-
-			// 获取下一页
-			const token = page.data.syncTag;
-			if (typeof token !== 'string' || !token || pageTokens.has(token)) {
-				throw new Error('Xiaomi Notes pagination stopped advancing');
-			}
-			pageTokens.add(token);
-			await this.assertActive();
-			page = await waitFor(this.minoteApi.fetchPage(token), 30_000, this.control.signal);
-		}
+		});
 	}
 
 	private readExtraInfo(raw: unknown): { title?: unknown; isPrivate?: unknown; v3SyncId?: unknown } {
@@ -219,7 +198,7 @@ export default class NoteSyncer {
 		return folderId === '2' || flag === true || flag === 'true' || flag === 1;
 	}
 
-	private async createFolders() {
+	private async createFolders(includedFolders?: Set<string>) {
 		// 添加默认文件夹
 		this.folders.unshift({ id: '0', name: '未分类', category: '未分类' });
 
@@ -237,6 +216,7 @@ export default class NoteSyncer {
 			usedNames.add(this.pathKey(folder.name));
 			// 更新文件夹字典
 			this.folderDict[folder.id] = folder;
+			if (includedFolders && !includedFolders.has(folder.id)) continue;
 
 			// 创建文件夹目录
 			await this.fileManager.createFolder(folder.name);
@@ -250,18 +230,19 @@ export default class NoteSyncer {
 				account: this.account || undefined,
 				syncTime: Date.now()
 			});
+			this.oldFolders.delete(this.pathKey(folder.name));
 		}
 	}
 
-	private async syncNotes(force: boolean, onProgress: (result: ImportCounts) => void) {
+	private async syncNotes(notes: Note[], force: boolean, onProgress: (result: ImportCounts) => void) {
 		const result: ImportCounts = {
-			total: this.notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {}
+			total: notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {}
 		};
 		this.progressResult = result;
 		onProgress(result);
 
 		// 记录此次同步信息
-		for (const note of this.notes) {
+		for (const note of notes) {
 			const previous = this.lastSyncedNotes[note.id];
 			let step = '检查本地文件';
 			try {
@@ -500,10 +481,9 @@ export default class NoteSyncer {
 		delete previous.pendingMove;
 	}
 
-	private async cleanRemovedContent(result: ImportCounts) {
+	private async cleanRemovedContent(inScopeIds: Set<string>, result: ImportCounts) {
 		await this.assertActive();
-		const cloudIds = new Set(this.notes.map(note => note.id));
-		const stale = Object.values(this.lastSyncedNotes).filter(item => !cloudIds.has(item.id));
+		const stale = Object.values(this.lastSyncedNotes).filter(item => !inScopeIds.has(item.id));
 		const fail = (step: string) => {
 			result.failed++;
 			result.failuresByStep[step] = (result.failuresByStep[step] || 0) + 1;
@@ -545,10 +525,8 @@ export default class NoteSyncer {
 				fail('处理图片');
 			}
 		}
-		const currentFolders = new Set(this.thisTimeSynced.filter(item => item.type === 'folder').map(item => this.pathKey(item.relativePath)));
 		for (const [key, folder] of this.oldFolders) {
 			await this.assertActive();
-			if (currentFolders.has(key)) { this.oldFolders.delete(key); continue; }
 			if (folder.account !== this.account) continue;
 			try {
 				await this.fileManager.deleteEmptyFolder(path.posix.join(folder.relativePath, 'img'));

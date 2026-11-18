@@ -9,6 +9,7 @@ import NoteSyncer from './src/noteSyncer';
 import MinoteWebSession from './src/minoteWebSession';
 import { MINOTE_VIEW_TYPE, MinoteView } from './src/minoteView';
 import { assertImportActive, ImportCancelledError, WebSessionError } from './src/importControl';
+import { creationDateBounds, ImportOptionsError } from './src/importOptions';
 
 export default class MinotePlugin extends Plugin {
 	webSession!: MinoteWebSession;
@@ -83,11 +84,13 @@ export default class MinotePlugin extends Plugin {
 		return this.activeTask;
 	}
 	private async runImport(force: boolean, signal: AbortSignal): Promise<void> {
-		const { noteLocation } = get(settingsStore);
+		const options = get(settingsStore);
+		const { noteLocation } = options;
 		const progress = new Notice('正在准备小米云连接…', 0);
 		const updateProgress = (message: string) => { importProgress.set(message); progress.setMessage(message); };
 		updateProgress('正在准备小米云连接…');
 		try {
+			creationDateBounds(options);
 			await this.openMinote();
 			const snapshot = await this.webSession.ensureReady({ signal, onWaiting: () => {
 				updateProgress('请在页面中完成登录或设备验证，完成后将自动继续导入。');
@@ -107,7 +110,7 @@ export default class MinotePlugin extends Plugin {
 				if (Date.now() < nextUpdate && processed < counts.total) return;
 				nextUpdate = Date.now() + 500;
 				updateProgress(`正在导入小米笔记，已处理 ${processed}/${counts.total} 篇。保存位置：${fileManager.destination}`);
-			}, control);
+			}, control, options);
 			const { total, count, skipped, locked, failed, partial, deleted, failuresByStep, synced } = result;
 			const status = result.interrupted || (locked || failed || partial ? '导入结束，仍有内容待处理' : '导入完成');
 			const breakdown = Object.entries(failuresByStep).map(([step, amount]) => `${step} ${amount} 篇`).join('、');
@@ -118,7 +121,8 @@ export default class MinotePlugin extends Plugin {
 			new Notice(summary, 15000);
 		} catch (error) {
 			const status = error instanceof ImportCancelledError || signal.aborted ? '导入已取消'
-				: error instanceof WebSessionError ? error.message : '导入中断，请检查小米云连接、网络及保存目录后重试。';
+				: error instanceof WebSessionError || error instanceof ImportOptionsError ? error.message
+					: '导入中断，请检查小米云连接、网络及保存目录后重试。';
 			const summary = `${status} 保存位置：${noteLocation}。`;
 			await settingsStore.actions.setImportResult(noteLocation, summary).catch(() => undefined);
 			new Notice(summary, 10000);
