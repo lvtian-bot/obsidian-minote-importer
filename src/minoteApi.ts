@@ -7,13 +7,21 @@ import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from 'obsid
 import { get } from 'svelte/store';
 
 import { runtimeCredentials, settingsStore } from './settings';
-import { WebSessionError } from './importControl';
+import { assertImportActive, waitFor, WebSessionError, type ImportControl } from './importControl';
 import { createHash } from 'crypto';
 
 export interface ProfileCheckResult {
 	ok: boolean;
 	nickname?: string;
 	status?: 'authenticated' | 'unauthenticated' | 'unavailable';
+}
+
+export function readCloudFolder(entry: { type?: unknown; id?: unknown; subject?: unknown } | null) {
+	if (!entry || entry.type !== 'folder' || !/^\d+$/.test(String(entry.id))) throw new Error('Invalid cloud folder');
+	const id = String(entry.id);
+	if (id === '0' || id === '2') return undefined;
+	const name = typeof entry.subject === 'string' && entry.subject.trim() ? entry.subject : '未命名分类';
+	return { id, name };
 }
 
 export default class MinoteApi {
@@ -92,6 +100,38 @@ export default class MinoteApi {
 		};
 		const resp = await this.requestImport(req);
 		return resp.json;
+	}
+
+	async readInventory(control: ImportControl, onPage: (entries: any[], folders: any[]) => void) {
+		const pageTokens = new Set<string>();
+		let token = '';
+		while (true) {
+			await assertImportActive(control);
+			const page = await waitFor(this.fetchPage(token), 30_000, control.signal);
+			await assertImportActive(control);
+			if ((page?.code !== undefined && page.code !== 0) || !Array.isArray(page?.data?.entries)
+				|| !Array.isArray(page?.data?.folders) || typeof page.data.lastPage !== 'boolean') {
+				throw new Error('Invalid Xiaomi Notes inventory');
+			}
+			onPage(page.data.entries, page.data.folders);
+			if (page.data.lastPage) return;
+			token = page.data.syncTag;
+			if (typeof token !== 'string' || !token || pageTokens.has(token)) {
+				throw new Error('Xiaomi Notes pagination stopped advancing');
+			}
+			pageTokens.add(token);
+		}
+	}
+
+	async listFolders(control: ImportControl) {
+		const folders = new Map([['0', '未分类']]);
+		await this.readInventory(control, (_entries, entries) => {
+			for (const entry of entries) {
+				const folder = readCloudFolder(entry);
+				if (folder && !folders.has(folder.id)) folders.set(folder.id, folder.name);
+			}
+		});
+		return folders;
 	}
 
 	async fetchNoteDetails(noteId: string) {

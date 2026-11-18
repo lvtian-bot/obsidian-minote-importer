@@ -54,6 +54,10 @@ test('迁移删除旧认证字段，保留路径和导入历史，新凭据仅�
   await settingsStore.initialize({ loadData: async () => fixture, saveData: async data => { saved = data; } });
   assert.equal(saved.noteLocation, '我的导入');
   assert.equal(saved.lastTimeSynced.length, 1);
+  assert.equal(saved.importMode, 'mirror');
+  assert.equal(saved.folderSelection, null);
+  assert.equal(saved.createdFrom, '');
+  assert.equal(saved.createdThrough, '');
   for (const key of ['cookie','webLoginConfirmed','isCookieValid','browserPath']) assert.equal(key in saved, false);
   assert.equal(get(runtimeCredentials), '');
   settingsStore.actions.setLogin('userId=42', '测试账号');
@@ -94,6 +98,27 @@ test('就绪检查固定会话，账号变化时在正文执行前停止', async
   fixture.setUser('43');
   await assert.rejects(fixture.service.readEncryptedNote({ id: '1', content: '', encryptInfo: null }), WebSessionError);
   assert.equal(fixture.evaluations(), count);
+});
+
+test('读取文件夹复用网页登录，但不建立导入任务，账号变化后丢弃读取结果', async () => {
+  const fixture = fakeSession();
+  let changeAccount = false;
+  transport = async ({ url }) => {
+    if (new URL(url).pathname === '/status/lite/profile') {
+      return { status: 200, json: { data: { nickname: '测试账号' } } };
+    }
+    if (changeAccount) fixture.setUser('43');
+    return { status: 200, json: { code: 0, data: { entries: [],
+      folders: [{ id: '10', type: 'folder', subject: '测试文件夹' }], lastPage: true } } };
+  };
+  const signal = new AbortController().signal;
+  const result = await fixture.service.readFolders(signal);
+  assert.ok(result.account);
+  assert.deepEqual([...result.folders], [['0', '未分类'], ['10', '测试文件夹']]);
+  assert.equal(fixture.evaluations(), 0);
+  await assert.rejects(fixture.service.assertActive(), WebSessionError);
+  changeAccount = true;
+  await assert.rejects(fixture.service.readFolders(signal), /账号或页面已变化/);
 });
 
 test('设备验证未完成时等待，验证通过后自动返回就绪会话', async () => {

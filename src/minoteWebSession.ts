@@ -208,6 +208,24 @@ export default class MinoteWebSession {
 			this.accountState.update(state => state.checking ? { ...state, checking: false } : state);
 		}
 	}
+	async readFolders(signal: AbortSignal) {
+		const generation = this.generation;
+		const host = this.host;
+		const loginRequired = '请先打开小米笔记并完成登录，再读取文件夹。';
+		if (!this.contents || this.contents.isDestroyed()) throw new WebSessionError(loginRequired);
+		await waitFor(this.refreshAccount(), 16_000, signal);
+		const api = new MinoteApi({ host, cookie: await this.cookie() });
+		const account = api.accountKey;
+		if (!account || this.verified?.key !== account) throw new WebSessionError(loginRequired);
+		const assertActive = async () => {
+			const current = new MinoteApi({ host, cookie: await this.cookie() });
+			if (this.generation !== generation || this.host !== host || current.accountKey !== account) {
+				throw new WebSessionError('小米账号或页面已变化，请重新读取文件夹。');
+			}
+		};
+		return { account, folders: await api.listFolders({ signal, assertActive }) };
+	}
+
 	async ensureReady(options: { signal: AbortSignal; onWaiting: () => void }): Promise<WebSessionSnapshot> {
 		this.signal = options.signal;
 		this.snapshot = undefined;

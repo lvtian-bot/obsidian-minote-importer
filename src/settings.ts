@@ -7,8 +7,9 @@ import { normalizePath } from 'obsidian';
 
 import type MinotePlugin from 'main';
 import type { SyncInfo } from './models';
+import { defaultImportOptions, type ImportOptions } from './importOptions';
 
-interface MinotePluginSettings {
+interface MinotePluginSettings extends ImportOptions {
 	noteLocation: string;
 	host: string;
 	accountLoggedIn: boolean;
@@ -19,6 +20,7 @@ interface MinotePluginSettings {
 };
 
 const DEFAULT_SETTINGS: MinotePluginSettings = {
+	...defaultImportOptions,
 	noteLocation: 'minote-importer',
 	host: 'i.mi.com',
 	accountLoggedIn: false,
@@ -64,6 +66,10 @@ const createSettingsStore = () => {
 
 	const setNoteLocationFolder = (value: string) => {
 		store.update(state => ({ ...state, noteLocation: normalizePath(value) }));
+	};
+
+	const setImportOptions = (options: Partial<ImportOptions>) => {
+		store.update(state => ({ ...state, ...options }));
 	};
 
 	const setHost = (value: string) => {
@@ -125,6 +131,7 @@ const createSettingsStore = () => {
 		initialize,
 		actions: {
 			setNoteLocationFolder,
+			setImportOptions,
 			setHost,
 			clearCookie,
 			setLogin,
