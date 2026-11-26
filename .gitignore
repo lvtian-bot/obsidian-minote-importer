@@ -23,3 +23,6 @@ data.json
 
 # Exclude trae files
 .trae/
+
+# Local build and backup artifacts
+/local-builds/
