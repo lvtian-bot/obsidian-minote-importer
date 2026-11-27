@@ -86,21 +86,22 @@ export default class MinotePlugin extends Plugin {
 	private async runImport(force: boolean, signal: AbortSignal): Promise<void> {
 		const options = get(settingsStore);
 		const { noteLocation } = options;
+		const control = { signal, assertActive: () => this.webSession.assertActive() };
 		const progress = new Notice('正在准备小米云连接…', 0);
 		const updateProgress = (message: string) => { importProgress.set(message); progress.setMessage(message); };
 		updateProgress('正在准备小米云连接…');
 		try {
 			creationDateBounds(options);
+			const vault = this.app.vault;
+			const fileManager = new FileManager(vault, vault.adapter as FileSystemAdapter, noteLocation,
+				() => assertImportActive(control));
+			if (options.importMode === 'mirror') fileManager.getMirrorBackupDestination();
 			await this.openMinote();
 			const snapshot = await this.webSession.ensureReady({ signal, onWaiting: () => {
 				updateProgress('请在页面中完成登录或设备验证，完成后将自动继续导入。');
 			} });
 			settingsStore.actions.setLogin(snapshot.cookie, get(this.webSession.accountState).nickname);
-			const control = { signal, assertActive: () => this.webSession.assertActive() };
 			await assertImportActive(control);
-			const vault = this.app.vault;
-			const fileManager = new FileManager(vault, vault.adapter as FileSystemAdapter, noteLocation,
-				() => assertImportActive(control));
 			const syncer = new NoteSyncer(fileManager, new MinoteApi(snapshot), this.webSession,
 				record => settingsStore.actions.checkpointMove(fileManager.destination, record));
 			updateProgress(`正在读取小米云笔记清单… 保存位置：${fileManager.destination}`);
@@ -111,12 +112,13 @@ export default class MinotePlugin extends Plugin {
 				nextUpdate = Date.now() + 500;
 				updateProgress(`正在导入小米笔记，已处理 ${processed}/${counts.total} 篇。保存位置：${fileManager.destination}`);
 			}, control, options);
-			const { total, count, skipped, locked, failed, partial, deleted, failuresByStep, synced } = result;
+			const { total, count, skipped, locked, failed, partial, archived, backup, failuresByStep, synced } = result;
 			const status = result.interrupted || (locked || failed || partial ? '导入结束，仍有内容待处理' : '导入完成');
 			const breakdown = Object.entries(failuresByStep).map(([step, amount]) => `${step} ${amount} 篇`).join('、');
 			const details = breakdown ? ` 失败环节：${breakdown}。` : '';
-			const summary = `${status}。保存位置：${fileManager.destination}。共 ${total} 篇，写入 ${count} 篇，已在本地且无变化 ${skipped} 篇，待解密 ${locked} 篇，失败 ${failed} 篇，移至回收站 ${deleted} 篇。已写入的笔记中有 ${partial} 篇图片待补齐。${details}`;
-			const preserveHistory = result.interrupted && !synced.length && !count && !deleted;
+			const backupDetails = backup ? ` 备份位置：${backup}。` : '';
+			const summary = `${status}。保存位置：${fileManager.destination}。共 ${total} 篇，写入 ${count} 篇，已在本地且无变化 ${skipped} 篇，待解密 ${locked} 篇，失败 ${failed} 篇，移出 ${archived} 个文件。已写入的笔记中有 ${partial} 篇图片待补齐。${backupDetails}${details}`;
+			const preserveHistory = result.interrupted && !synced.length && !count && !archived;
 			await settingsStore.actions.setImportResult(fileManager.destination, summary, preserveHistory ? undefined : synced);
 			new Notice(summary, 15000);
 		} catch (error) {

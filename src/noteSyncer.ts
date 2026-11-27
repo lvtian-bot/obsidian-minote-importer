@@ -3,7 +3,7 @@
  * @author Emac
  * @date 2025-01-05
  */
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { get } from 'svelte/store';
 
 import { settingsStore } from './settings';
@@ -12,7 +12,7 @@ import MinoteApi, { readCloudFolder } from './minoteApi';
 import { assertImportActive, isTaskInterruption, ImportCancelledError, WebSessionError, waitFor, type ImportControl } from './importControl';
 import { importFilter, type ImportOptions } from './importOptions';
 import { isEncryptedNoteContent } from './webNote';
-import { formatTime, readNoteId, withNoteProperties } from './noteProperties';
+import { formatTime, withNoteProperties } from './noteProperties';
 import path from 'path';
 import type { Note, Folder, SyncInfo, ImageInfo, NoteContentReader } from './models';
 
@@ -27,7 +27,8 @@ interface ImportCounts {
 	locked: number;
 	failed: number;
 	partial: number;
-	deleted: number;
+	archived: number;
+	backup?: string;
 	failuresByStep: Record<string, number>;
 	cancelled?: boolean;
 	interrupted?: string;
@@ -60,6 +61,7 @@ export default class NoteSyncer {
 		this.control = control;
 		this.progressResult = undefined;
 
+		if (options.importMode === 'mirror') await this.fileManager.validateMirrorPaths();
 		const settings = get(settingsStore);
 		this.account = this.minoteApi.accountKey;
 		this.history = settings.lastImportDestination === this.fileManager.destination ? settings.lastTimeSynced : [];
@@ -75,7 +77,7 @@ export default class NoteSyncer {
 				return acc;
 			}, {});
 
-		let result: ImportCounts = { total: 0, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {} };
+		let result: ImportCounts = { total: 0, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, archived: 0, failuresByStep: {} };
 		try {
 			const matches = importFilter(options, this.account);
 			await this.assertActive();
@@ -236,7 +238,7 @@ export default class NoteSyncer {
 
 	private async syncNotes(notes: Note[], force: boolean, onProgress: (result: ImportCounts) => void) {
 		const result: ImportCounts = {
-			total: notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, deleted: 0, failuresByStep: {}
+			total: notes.length, count: 0, skipped: 0, locked: 0, failed: 0, partial: 0, archived: 0, failuresByStep: {}
 		};
 		this.progressResult = result;
 		onProgress(result);
@@ -490,39 +492,85 @@ export default class NoteSyncer {
 		};
 		const currentAccount = new MinoteApi().accountKey;
 		if (!this.account || currentAccount !== this.account) {
-			for (const _ of stale) fail('检查本地文件');
+			fail('检查本地文件');
 			return;
 		}
-		for (const previous of stale) {
-			try {
+
+		const protectedPaths = new Set(this.thisTimeSynced.filter(item => item.type === 'note')
+			.map(item => this.pathKey(item.relativePath)));
+		for (const item of this.history) {
+			if (!item.account || item.account === this.account || item.type === 'folder') continue;
+			protectedPaths.add(this.pathKey(item.relativePath));
+			if (item.pendingMove) protectedPaths.add(this.pathKey(item.pendingMove));
+		}
+
+		const missing = new Set<string>();
+		let candidates: string[];
+		try {
+			for (const previous of stale) {
 				await this.assertActive();
 				await this.recoverPendingMove(previous);
-				const file = previous.relativePath;
-				if (await this.fileManager.exists(file)) {
-					if (previous.account !== this.account || this.pathOwnedByAnother(previous.id, file)
-						|| readNoteId(await this.fileManager.readFile(file)) !== previous.id) throw new Error('Note identity mismatch');
-					await this.fileManager.deleteFile(file);
-					result.deleted++;
+				if (!await this.fileManager.exists(previous.relativePath)) missing.add(previous.id);
+			}
+			const localFiles = await this.fileManager.listMirrorFiles();
+			const localPaths = new Set(localFiles.map(file => this.pathKey(file)));
+			for (const key of this.images.keys()) {
+				if (!localPaths.has(key)) this.images.delete(key);
+			}
+			candidates = localFiles.filter(file => !protectedPaths.has(this.pathKey(file)));
+		} catch (error) {
+			if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
+			fail('检查本地文件');
+			return;
+		}
+
+		const batch = new Date().toISOString().replace(/[:.]/g, '-') + '-' + randomUUID().slice(0, 8);
+		const archived = new Set<string>();
+		const archive = async (file: string) => {
+			try {
+				await this.assertActive();
+				if (await this.fileManager.archiveMirrorFile(file, batch)) {
+					result.archived++;
+					result.backup = this.fileManager.getMirrorBackupDestination() + '/' + batch;
 				}
-				delete this.lastSyncedNotes[previous.id];
+				archived.add(this.pathKey(file));
 			} catch (error) {
 				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
 				fail('检查本地文件');
 			}
-		}
-		// 待解密或写入失败时保留附件，避免根据不完整的正文判断图片已经无引用。
-		if (!result.locked && !result.partial && !result.failed) {
-			try {
-				const unused = await this.fileManager.unreferencedImages([...this.images.values()].map(item => item.relativePath));
-				for (const image of unused) {
-					await this.assertActive();
-					await this.fileManager.deleteFile(image);
-					this.images.delete(this.pathKey(image));
-					await this.fileManager.deleteEmptyFolder(path.posix.dirname(image));
+		};
+
+		// 对账后保留仍被笔记引用的图片，包括旧版未登记但存放在 img 目录的附件。
+		const images = new Set(candidates.filter(file => this.images.has(this.pathKey(file))
+			|| (path.posix.basename(path.posix.dirname(file)).toLowerCase() === 'img' && !/\.md$/i.test(file))));
+		try {
+			for (const file of candidates) {
+				if (!images.has(file)) await archive(file);
+			}
+			if (!result.failed && images.size) {
+				const unused = await this.fileManager.unreferencedImages([...images]);
+				for (const file of unused) await archive(file);
+			}
+		} catch (error) {
+			if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
+			fail('处理图片');
+		} finally {
+			for (const previous of stale) {
+				const key = this.pathKey(previous.relativePath);
+				if (archived.has(key) || protectedPaths.has(key) || missing.has(previous.id)) {
+					delete this.lastSyncedNotes[previous.id];
 				}
+			}
+			for (const key of archived) this.images.delete(key);
+		}
+		if (result.failed) return;
+		for (const image of images) {
+			if (!archived.has(this.pathKey(image))) continue;
+			try {
+				await this.fileManager.deleteEmptyFolder(path.posix.dirname(image));
 			} catch (error) {
 				if (isTaskInterruption(error) || this.control.signal?.aborted) throw error;
-				fail('处理图片');
+				fail('更新本地分类');
 			}
 		}
 		for (const [key, folder] of this.oldFolders) {

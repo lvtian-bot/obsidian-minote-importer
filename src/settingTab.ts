@@ -120,7 +120,7 @@ export class MinoteSettingTab extends PluginSettingTab {
 				.setValue(get(settingsStore).importMode)
 				.onChange(value => settingsStore.actions.setImportOptions({ importMode: value as ImportMode }));
 			disableControls.push(disabled => dropdown.setDisabled(disabled));
-		}).setDesc('镜像模式会将已导入但移出范围或在云端删除的笔记移入本地回收站。复制模式会保留这些笔记。');
+		}).setDesc('镜像模式会把需要清理的笔记、附件和其他文件移到同步目录旁边的同名 -delete 文件夹。例如，同步目录 minote 对应 minote-delete。请勿在同步目录中存放其他文件。复制模式会保留这些文件。');
 
 		new Setting(this.containerEl).setName('导入范围').setHeading();
 		const dateRow = new Setting(this.containerEl).setName('创建日期范围');

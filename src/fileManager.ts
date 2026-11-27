@@ -7,6 +7,7 @@ import { normalizePath } from 'obsidian';
 import type { FileSystemAdapter, Vault } from 'obsidian';
 import path from 'path';
 import { realpath, rmdir } from 'fs/promises';
+import { ImportOptionsError } from './importOptions';
 
 export default class FileManager {
 	readonly destination: string;
@@ -61,21 +62,78 @@ export default class FileManager {
 		await this.vault.createFolder(fullPath);
 	}
 
-	private async ensureDirectory(directory: string): Promise<void> {
-		if (await this.adapter.exists(directory)) return;
-		const parent = path.posix.dirname(directory);
-		if (parent !== '.') await this.ensureDirectory(parent);
-		await this.beforeMutation?.();
-		await this.vault.createFolder(directory);
+	private async ensureDirectory(directory: string, verify = false): Promise<void> {
+		if (!await this.adapter.exists(directory)) {
+			const parent = path.posix.dirname(directory);
+			if (parent !== '.') await this.ensureDirectory(parent, verify);
+			await this.beforeMutation?.();
+			await this.vault.createFolder(directory);
+		}
+		if (verify) await this.assertDirectVaultPath(directory);
 	}
 
-	async deleteFile(filePath: string) {
-		if (!filePath || !await this.exists(filePath)) {
-			return;
+	getMirrorBackupDestination(): string {
+		if (this.destination === '/' || this.isProtectedPath(this.destination)) {
+			throw new ImportOptionsError('镜像模式需要选择笔记库内的子文件夹作为同步目录。');
 		}
+		return this.destination + '-delete';
+	}
 
+	async validateMirrorPaths(): Promise<void> {
+		const backup = this.getMirrorBackupDestination();
+		for (const directory of [this.destination, backup]) {
+			let existing = directory;
+			while (existing !== '.' && !await this.adapter.exists(existing)) existing = path.posix.dirname(existing);
+			if (existing !== '.') await this.assertDirectVaultPath(existing);
+		}
+	}
+
+	private isProtectedPath(relative: string): boolean {
+		const lower = relative.toLowerCase();
+		const config = this.vault.configDir.toLowerCase();
+		return lower === config || lower.startsWith(config + '/')
+			|| lower.split('/').some(segment => segment === '.trash' || segment === '.git');
+	}
+
+	private async assertDirectVaultPath(relative: string): Promise<void> {
+		const root = await realpath(this.adapter.getBasePath());
+		const actual = await realpath(this.adapter.getFullPath(relative));
+		if (path.relative(root, actual) !== path.normalize(relative)) {
+			throw new Error('Mirror path is not a direct vault path');
+		}
+	}
+
+	async listMirrorFiles(): Promise<string[]> {
+		this.getMirrorBackupDestination();
+		if (!await this.adapter.exists(this.destination)) return [];
+		const files: string[] = [];
+		const directories = [this.destination];
+		while (directories.length) {
+			const directory = directories.pop()!;
+			await this.assertDirectVaultPath(directory);
+			const children = await this.adapter.list(directory);
+			for (const folder of children.folders) {
+				if (!this.isProtectedPath(folder)) directories.push(folder);
+			}
+			for (const file of children.files) {
+				if (!this.isProtectedPath(file)) {
+					files.push(this.validateRelativePath(file.slice(this.destination.length + 1)));
+				}
+			}
+		}
+		return files;
+	}
+
+	async archiveMirrorFile(file: string, batch: string): Promise<boolean> {
+		const source = this.vaultPath(file);
+		if (!await this.adapter.exists(source)) return false;
+		await this.assertDirectVaultPath(source);
+		const target = this.getMirrorBackupDestination() + '/' + this.validateRelativePath(batch + '/' + file);
+		await this.ensureDirectory(path.posix.dirname(target), true);
+		if (await this.adapter.exists(target)) throw new Error('Mirror backup file already exists');
 		await this.beforeMutation?.();
-		await this.adapter.trashLocal(this.vaultPath(filePath));
+		await this.adapter.rename(source, target);
+		return true;
 	}
 
 	async deleteEmptyFolder(folderPath: string): Promise<void> {
@@ -99,13 +157,14 @@ export default class FileManager {
 		const unused = new Set(candidates);
 		const files = new Set<string>();
 		const directories = [''];
+		const archive = this.getMirrorBackupDestination().toLowerCase();
 		while (directories.length) {
 			const directory = directories.pop()!;
 			// 笔记库可能同时删除或移动目录；不把读不全的扫描结果用于清理。
 			const children = await this.adapter.list(directory);
 			for (const file of children.files) if (/\.md$/i.test(file)) files.add(file);
 			for (const folder of children.folders) {
-				if (!['.trash', '.git', this.vault.configDir].includes(folder)) directories.push(folder);
+				if (!this.isProtectedPath(folder) && folder.toLowerCase() !== archive) directories.push(folder);
 			}
 		}
 		const knownImage = /!\[(?:\\[^\r\n]|[^\]\\\r\n])*\]\(img\/([a-z\d_~.-]+)\)/gi;
