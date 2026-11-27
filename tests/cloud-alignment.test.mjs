@@ -43,8 +43,8 @@ let memoryVault;
 class MemoryVault {
   files = new Map();
   folders = new Set(['']);
-  trashed = [];
-  failTrash = new Set();
+  archived = [];
+  failArchive = new Set();
   writes = [];
   constructor() {
     const vault = this;
@@ -64,12 +64,6 @@ class MemoryVault {
         files: [...vault.files.keys()].filter(file => path.posix.dirname(file).replace(/^\.$/, '') === parent),
         folders: [...vault.folders].filter(file => file && path.posix.dirname(file).replace(/^\.$/, '') === parent)
       }),
-      trashLocal: async file => {
-        if (vault.failTrash.has(file)) throw Error('回收站写入失败');
-        if (!vault.files.has(file)) throw Error('禁止递归删除');
-        vault.trashed.push(file);
-        vault.files.delete(file);
-      },
       getBasePath: () => root,
       getFullPath: folder => path.join(root, folder),
       removeEmptyFolder: async folder => {
@@ -77,9 +71,11 @@ class MemoryVault {
         vault.folders.delete(folder);
       },
       rename: async (source, target) => {
+        if (vault.failArchive.has(source)) throw Error('移动失败');
         assert.equal(vault.files.has(target), false);
         vault.put(target, vault.files.get(source));
         vault.files.delete(source);
+        if (target.startsWith(vault.destination + '-delete/')) vault.archived.push(source);
       },
       copy: async (source, target) => vault.put(target, vault.files.get(source))
     };
@@ -96,6 +92,7 @@ class MemoryVault {
 
 async function setup({ entries = [], folders = [], pages, history = [], files = {}, destination = '导入', cookie = 'userId=42' } = {}) {
   const vault = memoryVault = new MemoryVault();
+  vault.destination = destination;
   for (const [file, body] of Object.entries(files)) vault.put(file, body);
   let saved;
   await settingsStore.initialize({ loadData: async () => ({
@@ -148,7 +145,7 @@ async function setup({ entries = [], folders = [], pages, history = [], files = 
 
 for (const force of [false, true]) {
   const mode = force ? '全量' : '增量';
-  test(`${mode}读取全部分页，删除云端消失的笔记并保留自行创建的文件`, async () => {
+  test(`${mode}读取全部分页，备份云端消失的笔记和自行创建的文件`, async () => {
     const note = cloudNote();
     const env = await setup({ entries: [note], pages: [page([], [cloudFolder()], false, 'next'), page([note])],
       files: { '导入/分类/笔记.md': markdown(note), '导入/分类/已删除.md': markdown(cloudNote('102')),
@@ -156,10 +153,10 @@ for (const force of [false, true]) {
     await env.setHistory([env.record(), env.record(cloudNote('102'), '分类/已删除.md')]);
     const result = await env.sync(force);
     assert.deepEqual(env.pageCalls, ['', 'next']);
-    assert.equal(result.deleted, 1);
+    assert.equal(result.archived, 2);
     assert.equal(result.failed, 0);
-    assert.deepEqual(env.vault.trashed, ['导入/分类/已删除.md']);
-    assert.equal(env.vault.files.get('导入/分类/自行创建.md'), '私人内容');
+    assert.deepEqual(env.vault.archived.sort(), ['导入/分类/已删除.md', '导入/分类/自行创建.md'].sort());
+    assert.equal(env.vault.files.get(result.backup + '/分类/自行创建.md'), '私人内容');
     assert.equal(env.detailCalls.length, force ? 1 : 0);
     assert.equal(result.synced.some(item => item.id === '102'), false);
   });
@@ -169,7 +166,7 @@ for (const force of [false, true]) {
     await env.setHistory([env.record(), env.folder()]);
     const result = await env.sync(force);
     assert.equal(result.total, 0);
-    assert.equal(result.deleted, 1);
+    assert.equal(result.archived, 1);
     assert.equal(env.vault.folders.has('导入/分类'), false);
   });
 
@@ -210,16 +207,19 @@ test('缩小范围时复制模式保留历史及图片，改用镜像模式后�
   settingsStore.actions.setImportOptions({ importMode: 'copy', folderSelection: { account: env.api.accountKey, ids: ['10'] } });
   const copy = await env.sync();
   assert.equal(copy.count, 1);
-  assert.equal(copy.deleted, 0);
-  assert.deepEqual(env.vault.trashed, []);
+  assert.equal(copy.archived, 0);
+  assert.deepEqual(env.vault.archived, []);
   assert.ok(copy.synced.some(item => item.id === outside.id));
   assert.ok(copy.synced.some(item => item.id === deleted.id));
   settingsStore.actions.setImportOptions({ importMode: 'mirror' });
   const mirror = await env.sync();
   assert.equal(mirror.failed, 0);
-  assert.equal(mirror.deleted, 2);
-  assert.deepEqual(env.vault.trashed.sort(), ['导入/其他/img/old.png', '导入/其他/云端已删除.md', '导入/其他/已移出范围.md'].sort());
-  assert.deepEqual([...env.vault.files.keys()].sort(), ['导入/其他/自行创建.md', '导入/分类/保留.md'].sort());
+  assert.equal(mirror.archived, 4);
+  assert.deepEqual(env.vault.archived.sort(), [
+    '导入/其他/img/old.png', '导入/其他/云端已删除.md', '导入/其他/已移出范围.md', '导入/其他/自行创建.md'
+  ].sort());
+  assert.deepEqual([...env.vault.files.keys()].filter(file => file.startsWith('导入/')), ['导入/分类/保留.md']);
+  assert.equal(env.vault.files.get(mirror.backup + '/其他/img/old.png'), '图片');
 });
 
 test('所选文件夹没有匹配笔记时，镜像模式仍清理已确认归属的历史笔记', async () => {
@@ -229,7 +229,7 @@ test('所选文件夹没有匹配笔记时，镜像模式仍清理已确认归�
   settingsStore.actions.setImportOptions({ folderSelection: { account: env.api.accountKey, ids: ['0'] } });
   const result = await env.sync();
   assert.equal(result.total, 0);
-  assert.equal(result.deleted, 1);
+  assert.equal(result.archived, 1);
   assert.equal(result.failed, 0);
   assert.deepEqual(env.detailCalls, []);
 });
@@ -248,7 +248,7 @@ test('其他账号的文件夹选择、无效日期范围和缺失的创建时�
   await assert.rejects(env.sync(), /小米笔记缺少有效的创建日期/);
   assert.deepEqual(env.detailCalls, []);
   assert.deepEqual(env.vault.writes, []);
-  assert.deepEqual(env.vault.trashed, []);
+  assert.deepEqual(env.vault.archived, []);
 });
 
 test('文件夹选择可读取全部分页，保留未分类与同名文件夹并排除私密文件夹', async () => {
@@ -287,7 +287,7 @@ test('移动分类时复制受管理图片，并清理旧图片和空目录', as
   assert.ok(result.synced.some(item => item.type === 'image' && item.relativePath === '新分类/img/photo.png'));
 });
 
-test('分类改名后保留旧分类中自行创建的文件', async () => {
+test('分类改名后备份旧分类中自行创建的文件', async () => {
   const env = await setup({ entries: [cloudNote()], folders: [cloudFolder('10', '新分类')], files: {
     '导入/分类/笔记.md': markdown(), '导入/分类/自行创建.md': '自己的内容'
   } });
@@ -295,7 +295,8 @@ test('分类改名后保留旧分类中自行创建的文件', async () => {
   const result = await env.sync();
   assert.equal(result.failed, 0);
   assert.equal(env.vault.files.has('导入/新分类/笔记.md'), true);
-  assert.equal(env.vault.files.get('导入/分类/自行创建.md'), '自己的内容');
+  assert.equal(env.vault.files.get(result.backup + '/分类/自行创建.md'), '自己的内容');
+  assert.equal(env.vault.folders.has('导入/分类'), false);
 });
 
 test('首次下载记录图片归属，后续删除笔记会清理无引用图片', async () => {
@@ -306,8 +307,8 @@ test('首次下载记录图片归属，后续删除笔记会清理无引用图�
   assert.ok(first.synced.some(item => item.type === 'image' && item.relativePath === '分类/img/photo.png'));
   env.api.fetchPage = async () => page([], []);
   const second = await env.sync();
-  assert.equal(second.deleted, 1);
-  assert.deepEqual(env.vault.trashed.sort(), ['导入/分类/img/photo.png', '导入/分类/笔记.md'].sort());
+  assert.equal(second.archived, 2);
+  assert.deepEqual(env.vault.archived.sort(), ['导入/分类/img/photo.png', '导入/分类/笔记.md'].sort());
 });
 
 test('图片仍被导入目录外的笔记引用时保留', async () => {
@@ -317,15 +318,21 @@ test('图片仍被导入目录外的笔记引用时保留', async () => {
   } });
   await env.setHistory([env.record(), env.image('分类/img/photo.png')]);
   const result = await env.sync();
-  assert.equal(result.deleted, 1);
+  assert.equal(result.archived, 1);
   assert.equal(env.vault.files.has('导入/分类/img/photo.png'), true);
 });
 
-test('未登记归属的旧图片保留', async () => {
-  const env = await setup({ files: { '导入/分类/笔记.md': markdown(), '导入/分类/img/unknown.png': '未知图片' } });
+test('未登记的旧图片按仍在使用的引用决定是否移出', async () => {
+  const env = await setup({ entries: [cloudNote()], folders: [cloudFolder()], files: {
+    '导入/分类/笔记.md': markdown(cloudNote(), '![](img/used.png)'),
+    '导入/分类/img/used.png': '仍在使用',
+    '导入/分类/img/unknown.png': '未知图片'
+  } });
   await env.setHistory([env.record()]);
-  await env.sync();
-  assert.equal(env.vault.files.has('导入/分类/img/unknown.png'), true);
+  const result = await env.sync();
+  assert.equal(result.archived, 1);
+  assert.equal(env.vault.files.get(result.backup + '/分类/img/unknown.png'), '未知图片');
+  assert.equal(env.vault.files.get('导入/分类/img/used.png'), '仍在使用');
 });
 
 for (const invalid of [new Error('分页请求失败'), page([], [], false, 'same'),
@@ -337,17 +344,25 @@ for (const invalid of [new Error('分页请求失败'), page([], [], false, 'sam
     await env.setHistory([env.record()]);
     await assert.rejects(env.sync());
     assert.equal(env.vault.files.has('导入/分类/笔记.md'), true);
-    assert.equal(env.vault.trashed.length, 0);
+    assert.equal(env.vault.archived.length, 0);
   });
 }
 
-test('旧记录的账号归属不明时保留文件并报告未完成', async () => {
-  const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
+test('旧记录缺少账号和笔记编号时仍可移到同级备份目录', async () => {
+  const destination = '附件/备份/minote';
+  const env = await setup({ destination, files: { [destination + '/分类/笔记.md']: '旧版正文' } });
   await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { account: undefined })]);
   const result = await env.sync();
-  assert.equal(result.deleted, 0);
-  assert.equal(result.failed, 1);
-  assert.equal(result.synced.find(item => item.id === '101').account, undefined);
+  assert.equal(result.archived, 1);
+  assert.equal(result.failed, 0);
+  assert.ok(result.backup.startsWith(destination + '-delete/'));
+  assert.equal(env.vault.files.get(result.backup + '/分类/笔记.md'), '旧版正文');
+  assert.equal(result.synced.some(item => item.id === '101'), false);
+  env.vault.put(destination + '/分类/笔记.md', '后来的文件');
+  const next = await env.sync();
+  assert.notEqual(next.backup, result.backup);
+  assert.equal(env.vault.files.get(result.backup + '/分类/笔记.md'), '旧版正文');
+  assert.equal(env.vault.files.get(next.backup + '/分类/笔记.md'), '后来的文件');
 });
 
 test('旧记录仍能通过当前云端 ID 确认归属，后续可以同步删除', async () => {
@@ -356,14 +371,14 @@ test('旧记录仍能通过当前云端 ID 确认归属，后续可以同步删�
   const first = await env.sync();
   assert.equal(first.synced.find(item => item.type === 'note').account, env.api.accountKey);
   env.api.fetchPage = async () => page();
-  assert.equal((await env.sync()).deleted, 1);
+  assert.equal((await env.sync()).archived, 1);
 });
 
 test('切换账号不删除原账号的记录和文件', async () => {
   const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
   await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { account: 'other-account' })]);
   const result = await env.sync();
-  assert.equal(result.deleted, 0);
+  assert.equal(result.archived, 0);
   assert.equal(env.vault.files.has('导入/分类/笔记.md'), true);
   assert.ok(result.synced.some(item => item.account === 'other-account'));
 });
@@ -379,30 +394,31 @@ test('同步期间切换账号时不执行清理，API 继续使用开始时的�
   const result = await env.sync();
   assert.equal(env.api.accountKey, originalKey);
   assert.equal(result.failed, 1);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
 test('无法读取稳定账号编号时不删除文件', async () => {
   const env = await setup({ cookie: '', files: { '导入/分类/笔记.md': markdown() } });
   await env.setHistory([env.record()]);
-  assert.equal((await env.sync()).deleted, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal((await env.sync()).archived, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
-test('本地路径已被其他笔记替换时不删除', async () => {
-  const env = await setup({ files: { '导入/分类/笔记.md': markdown(cloudNote('999')) } });
+test('已不在导入范围的路径被手动替换时原样备份替换后的文件', async () => {
+  const manual = markdown(cloudNote('999'));
+  const env = await setup({ files: { '导入/分类/笔记.md': manual } });
   await env.setHistory([env.record()]);
   const result = await env.sync();
-  assert.equal(result.deleted, 0);
-  assert.equal(result.failed, 1);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(result.archived, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(env.vault.files.get(result.backup + '/分类/笔记.md'), manual);
 });
 
 test('中断移动已完成时根据待移动路径清理云端已删除的笔记', async () => {
   const env = await setup({ files: { '导入/新分类/笔记.md': markdown() } });
   await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { pendingMove: '新分类/笔记.md' })]);
-  assert.equal((await env.sync()).deleted, 1);
-  assert.deepEqual(env.vault.trashed, ['导入/新分类/笔记.md']);
+  assert.equal((await env.sync()).archived, 1);
+  assert.deepEqual(env.vault.archived, ['导入/新分类/笔记.md']);
 });
 
 test('中断移动的两个位置都存在时不猜测删除', async () => {
@@ -410,18 +426,18 @@ test('中断移动的两个位置都存在时不猜测删除', async () => {
   await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { pendingMove: '新分类/笔记.md' })]);
   const result = await env.sync();
   assert.equal(result.failed, 1);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
-test('回收站操作失败时保留导入记录以便重试', async () => {
+test('备份移动失败时保留导入记录以便重试', async () => {
   const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
   await env.setHistory([env.record()]);
-  env.vault.failTrash.add('导入/分类/笔记.md');
+  env.vault.failArchive.add('导入/分类/笔记.md');
   const first = await env.sync();
   assert.equal(first.failed, 1);
   assert.ok(first.synced.some(item => item.id === '101'));
-  env.vault.failTrash.clear();
-  assert.equal((await env.sync()).deleted, 1);
+  env.vault.failArchive.clear();
+  assert.equal((await env.sync()).archived, 1);
 });
 
 test('旧编号迁移后仍能移动和更新，不误判为其他笔记占用', async () => {
@@ -443,22 +459,27 @@ test('加密正文暂时无法解密时保留文件和附件', async () => {
   await env.setHistory([env.record(), env.image('分类/img/photo.png'), env.record(cloudNote('102'), '分类/云端已删除.md')]);
   const result = await env.sync();
   assert.equal(result.locked, 1);
-  assert.equal(result.deleted, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(result.archived, 0);
+  assert.equal(env.vault.archived.length, 0);
   assert.equal(env.vault.files.has('导入/分类/云端已删除.md'), true);
 });
 
-test('保存位置不同不复用原目录的导入记录', async () => {
-  const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
+test('保存位置不同不复用原目录的导入记录，也不移出目录以外的文件', async () => {
+  const env = await setup({ entries: [cloudNote()], folders: [cloudFolder()],
+    files: { '其他目录/分类/笔记.md': markdown() } });
   await settingsStore.actions.setImportResult('其他目录', '', [env.record()]);
-  assert.equal((await env.sync()).deleted, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal((await env.sync()).archived, 0);
+  assert.deepEqual(env.detailCalls, ['101']);
+  assert.ok(env.vault.files.has('其他目录/分类/笔记.md'));
 });
 
-test('保存到笔记库根目录时只删除登记的笔记', async () => {
+test('镜像模式拒绝笔记库根目录，复制模式仍可使用根目录', async () => {
   const env = await setup({ destination: '/', files: { '分类/笔记.md': markdown(), '其他.md': '自建内容' } });
   await env.setHistory([env.record()]);
-  assert.equal((await env.sync()).deleted, 1);
+  await assert.rejects(env.sync(), /镜像模式需要选择笔记库内的子文件夹/);
+  assert.deepEqual(env.pageCalls, []);
+  await settingsStore.actions.setImportOptions({ importMode: 'copy' });
+  assert.equal((await env.sync()).archived, 0);
   assert.equal(env.vault.files.get('其他.md'), '自建内容');
 });
 
@@ -501,7 +522,7 @@ test('图片未下载完整时保留旧笔记和旧图片，下次继续重试',
   assert.equal(result.failed, 1);
   assert.equal(env.vault.files.has('导入/分类/笔记.md'), true);
   assert.equal(env.vault.files.has('导入/分类/img/old-photo.png'), true);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
 test('移动完成后进程中断，重试删除时恢复目标图片归属', async () => {
@@ -512,7 +533,7 @@ test('移动完成后进程中断，重试删除时恢复目标图片归属', as
   await env.setHistory([env.record(cloudNote(), '分类/笔记.md', { pendingMove: '新分类/笔记.md' }),
     env.image('分类/img/photo.png')]);
   const result = await env.sync();
-  assert.equal(result.deleted, 1);
+  assert.equal(result.archived, 3);
   assert.equal(env.vault.files.has('导入/新分类/img/photo.png'), false);
 });
 
@@ -574,7 +595,7 @@ test('取消未开始的导入时不读取清单、不写入、不清理并保�
   assert.equal(result.cancelled, true);
   assert.equal(env.pageCalls.length, 0);
   assert.equal(env.vault.writes.length, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
   assert.ok(result.synced.some(item => item.id === '101'));
 });
 
@@ -592,7 +613,7 @@ test('正文读取期间取消时保留已完成记录和未处理文件，不�
   assert.equal(result.cancelled, true);
   assert.equal(result.count, 1);
   assert.equal(result.failed, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
   assert.ok(result.synced.some(item => item.id === '101'));
   assert.ok(result.synced.some(item => item.id === '102'));
   assert.ok(env.vault.files.has('导入/分类/旧笔记.md'));
@@ -606,8 +627,8 @@ test('处理完最后一篇时取消也不会进入云端删除清理', async ()
   const result = await env.sync(false, { signal: controller.signal }, counts => { if (counts.count) controller.abort(); });
   assert.equal(result.count, 1);
   assert.equal(result.cancelled, true);
-  assert.equal(result.deleted, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(result.archived, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
 test('读取后会话变化立即停止，不把连接失效吞成逐篇失败', async () => {
@@ -622,13 +643,13 @@ test('读取后会话变化立即停止，不把连接失效吞成逐篇失败',
   assert.equal(env.vault.writes.length, 0);
 });
 
-test('文件写入与回收站操作均受取消保护', async () => {
+test('文件写入与备份移动均受取消保护', async () => {
   const env = await setup({ files: { '导入/分类/笔记.md': markdown() } });
   const manager = new FileManager(env.vault, env.vault.adapter, '导入', async () => { throw new ImportCancelledError(); });
   await assert.rejects(manager.saveFile('分类/笔记.md', '新正文', time, time), ImportCancelledError);
-  await assert.rejects(manager.deleteFile('分类/笔记.md'), ImportCancelledError);
+  await assert.rejects(manager.archiveMirrorFile('分类/笔记.md', '取消的批次'), ImportCancelledError);
   assert.equal(env.vault.writes.length, 0);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
 
 test('清单请求未返回时取消也能结束，并忽略晚到的清单', async () => {
@@ -641,8 +662,8 @@ test('清单请求未返回时取消也能结束，并忽略晚到的清单', as
   setTimeout(() => controller.abort(), 10);
   const result = await pending;
   assert.equal(result.cancelled, true);
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
   complete(page());
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(env.vault.trashed.length, 0);
+  assert.equal(env.vault.archived.length, 0);
 });
