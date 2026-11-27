@@ -129,4 +129,4 @@ Minote Importer 是 Obsidian 桌面插件，供小米云笔记用户将笔记、
 
 - 维护仓库为 `lvtian-bot/obsidian-minote-importer`，保留与 `emac/obsidian-minote-plugin` 的 Fork 关联，以及原作者署名和 MIT 许可。
 - 版本以 `manifest.json` 为准，调整时同步 `package.json`、`package-lock.json` 和 `versions.json`。本地更新时，将新构建的 `main.js` 和 `manifest.json` 覆盖到笔记库的 `.obsidian/plugins/minote-importer/`，保留插件数据，重新加载后核对版本。
-- 项目暂无专用发版技能。GitHub Releases 由 `.github/workflows/release.yml` 处理，发布标签须与 `manifest.json` 中的版本一致。
+- 发布版本使用 `obsidian-plugin-release` 技能。GitHub Releases 由 `.github/workflows/release.yml` 处理，发布标签须与 `manifest.json` 中的版本一致。
